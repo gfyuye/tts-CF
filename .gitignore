@@ -5,3 +5,6 @@ node_modules/
 *.log
 .DS_Store
 dist/
+# Docker 相关
+docker/data/db.json
+docker/.env
