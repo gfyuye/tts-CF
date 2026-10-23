@@ -510,9 +510,11 @@ async function getDynamicToken() {
   }
 }
 
+// 刷新 token（内部实现，不做单飞；调用方负责单飞）
 async function refreshToken(DB, voiceName, style) {
   console.log('🔄 开始刷新token');
 
+  // ============ 阶段 1：本地直连微软（3 次） ============
   for (let i = 0; i < 3; i++) {
     const tokenData = await getDynamicToken();
 
@@ -532,10 +534,14 @@ async function refreshToken(DB, voiceName, style) {
       continue;
     }
 
-    console.log(`✅ token: ${region}(优先级${priority}, 有效期${timeInfo.text})，语言及风格匹配成功。`);
+    // 匹配成功：写入缓存 + D1，供后续复用（与阶段 2 行为一致）
+    console.log(`✅ token: ${region}(优先级${priority}, 有效期${timeInfo.text})，语言及风格匹配成功，已缓存。`);
+    tokenCache.set(region, tokenData);
+    await saveTokenCacheToD1(DB);
     return tokenData;
   }
 
+  // ============ 阶段 2：远程节点（按 REMOTETOKEN 顺序） ============
   console.log('❌ 无匹配语言及风格的token，从远程获取');
 
   const remoteServices = getRemoteServices();
@@ -556,7 +562,7 @@ async function refreshToken(DB, voiceName, style) {
 
     if (isMatch) {
       const remoteTimeInfo = formatRemainingTime(remoteToken.expiry);
-      console.log(`✅ 远程获取匹配token成功: ${remoteToken.region}(优先级${remoteToken.priority}, ${remoteTimeInfo.text})`);
+      console.log(`✅ 远程获取匹配token成功: ${remoteToken.region}(优先级${remoteToken.priority}, ${remoteTimeInfo.text})，已缓存。`);
       tokenCache.set(remoteToken.region, remoteToken);
       await saveTokenCacheToD1(DB);
       return remoteToken;
