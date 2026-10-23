@@ -1,20 +1,26 @@
-FROM node:20-slim
+# ============ 构建阶段 ============
+FROM node:20-alpine AS builder
 
 WORKDIR /app
-
-# 安装依赖（无第三方依赖，仅占位）
 COPY docker/package.json ./
 RUN npm install --omit=dev
 
-# 复制 docker 目录文件
-COPY docker/server.js docker/d1-json.js ./
+# ============ 运行阶段 ============
+FROM node:20-alpine
 
-# 复制主仓库的 worker.js（从上级目录）
+WORKDIR /app
+
+COPY --from=builder /app/node_modules ./node_modules
+COPY docker/package.json ./
+COPY docker/server.js docker/d1-json.js ./
 COPY worker.js ./
 
-# 数据目录
-RUN mkdir -p /app/data
+# 非 root 用户 + 数据目录
+RUN mkdir -p /app/data && \
+    addgroup -S app && adduser -S app -G app && \
+    chown -R app:app /app
+
+USER app
 
 EXPOSE 8787
-
 CMD ["node", "server.js"]
