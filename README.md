@@ -11,6 +11,7 @@
 - 🔄 **自动刷新**：`scheduled` 定时刷新端点表，分批并发降低 CPU 峰值
 - 🤖 **OpenAI 兼容**：`/v1/audio/speech` 支持 OpenAI TTS 客户端
 - 🎨 **Web 界面**：内置在线 TTS 试听页
+- 🧩 **独立 token-worker**：附带可插入任意 Worker 的轻量 token 获取模块
 
 ## 路由
 
@@ -26,6 +27,23 @@
 | `/reader.json` | GET | 阅读 App 导入配置 |
 | `/reader-post.json` | GET | 阅读 App 导入配置（POST） |
 | `/ifreetime.json` | GET | 爱阅记导入配置 |
+
+## 文件结构
+
+```
+.
+├── README.md
+├── worker.js                 # 主 TTS Worker
+├── token-worker.js           # 独立 token 获取模块（可选）
+├── wrangler.toml
+├── schema.sql
+├── package.json
+├── .gitignore
+├── LICENSE                   # AGPL-3.0
+└── .github/
+    └── workflows/
+        └── deploy.yml
+```
 
 ---
 
@@ -80,6 +98,7 @@ git push origin main
 ```
 
 GitHub Actions 自动执行：
+
 1. ✅ 检查配置
 2. 📦 查询/创建 D1 数据库 `tts-db`
 3. 📝 注入 `database_id` 到 `wrangler.toml`
@@ -144,7 +163,7 @@ Dashboard 中 Trigger deploy，或 push 一次提交。
 
 ---
 
-## 两种部署方式对比
+### 两种部署方式对比
 
 | 项 | 方式一（GitHub Actions） | 方式二（Dashboard 连接 Git） |
 |---|---|---|
@@ -302,6 +321,215 @@ npm run tail
 - 对方节点返回 token，写入本地缓存和 D1
 - 回环检测：A 调 B 后，B 记录"A 刚调过我"，B 反向调 A 时跳过
 
+### Token 调用逻辑
+
+```
+/tts ──► getVoice ──► getBestToken ──► refreshToken ──► getDynamicToken（直连微软）
+                                              │
+                                              └─► getTokenFromRemoteService（远程节点）
+```
+
+- `getBestToken` 是所有路径获取 token 的唯一入口
+- 缓存命中且未过期 → 直接返回
+- 缓存命中但即将过期（< 5 分钟）→ 返回旧 token + 后台刷新
+- 缓存未命中 → `ensureRefresh` 单飞刷新
+- `refreshToken` 阶段 1 直连微软，阶段 2 远程节点
+- **无论本地直连还是远程，匹配 `voiceName` + `style` 成功后均写入 `tokenCache` + D1**，供后续复用
+
+---
+
+## 附：token-worker 模块（独立 token 获取）
+
+仓库包含 `token-worker.js`，是一个**完全独立、自包含**的 token 获取模块，可插入到任意 Cloudflare Worker 中，让该 Worker 也提供 `/get-token` 端点，供其他 TTS Worker 获取 token。
+
+### 适用场景
+
+- 你有一个非 TTS 的 Worker（如 API 网关、工具服务），希望它也能为 TTS Worker 提供 token
+- 你希望多个 TTS Worker 共享一个"专职 token 节点"
+- 你不想在每个 TTS Worker 里都实现完整的微软 token 拉取逻辑
+
+### 设计要点
+
+| 项 | 说明 |
+|---|---|
+| **仅前 5 级** | 只请求 `southeastasia/eastus/westeurope/westus2/eastasia`，后 4 级不请求 |
+| **不引入节点鉴权** | 无 `X-Node-Id` / `X-Auth` / `X-TS`，仅 `API_KEY` 鉴权，适合非 TTS Worker |
+| **恒定时间比较** | API Key 用 `tokenWorkerTimingSafeEqual`，防时序侧信道 |
+| **未配置 API Key 拒绝** | 与主 `worker.js` 行为一致 |
+| **CORS 支持** | 保留 `Access-Control-Allow-*`，支持浏览器跨域 |
+| **3 次重试** | 前 5 级优先，3 次都失败返回最后 token |
+
+> **为什么只保留前 5 级？**
+> 主 `worker.js` 若只拿到后 4 级（`westus/centralindia/northeurope/japaneast`），说明前 5 级当前不可用。此时向远方 `/get-token` 获取，远方同样只能拿后 4 级，**没有增量价值**，反而增加延迟和调用。因此 `token-worker.js` 专注返回前 5 级高质量 token。
+
+### 使用步骤
+
+#### 步骤 1：复制模块
+
+将 `token-worker.js` 的**全部内容**粘贴到目标 Worker 的 `worker.js` 末尾（或单独文件后 import）。
+
+#### 步骤 2：在 `fetch` 入口插入路由
+
+```js
+export default {
+  async fetch(request, env) {
+    const path = new URL(request.url).pathname;
+
+    // 插入点：/get-token 或 /token
+    if (path === '/get-token' || path === '/token') {
+      return await handleGetToken(request, env);
+    }
+
+    // 其他业务逻辑...
+    return new Response('Hello');
+  }
+};
+
+// ============================================================
+// token-worker模块开始
+// ============================================================
+// ...（粘贴 token-worker.js 全部内容）...
+// ============================================================
+// token-worker模块结束
+// ============================================================
+```
+
+#### 步骤 3：配置 API Key
+
+```bash
+npx wrangler secret put API_KEY
+```
+
+或在 `wrangler.toml` 中：
+
+```toml
+[vars]
+API_KEY = "token-secret-abc"
+```
+
+> `API_KEY` 是 token-worker **自己的**密钥，用于校验 TTS Worker 调用 `/get-token` 时携带的 `X-API-Key`。
+> TTS Worker 的 `REMOTETOKEN` 中对应行的 `api_key` 必须与此值相同。
+> **与 TTS Worker 自身的 `API_KEY`（对外 `/tts` 用）无关**，可以是不同值。
+
+### 与主 `worker.js` 的关系
+
+```
+┌──────────────────┐         /get-token          ┌──────────────────┐
+│  TTS Worker      │ ◄─────────────────────────► │  token-worker    │
+│  (worker.js)     │   X-API-Key                 │  (token-worker.js)│
+│  9 区域 + 缓存   │                             │  仅前 5 级        │
+└──────────────────┘                             └──────────────────┘
+```
+
+- **TTS Worker**：完整的 9 区域 token 池、缓存、远程互调
+- **token-worker**：轻量级，仅提供前 5 级 token 获取，供 TTS Worker 调用
+
+### 接口
+
+**请求**：
+
+```http
+GET /get-token
+X-API-Key: your-api-key
+```
+
+或：
+
+```http
+GET /get-token?api_key=your-api-key
+```
+
+**响应（成功）**：
+
+```json
+{
+  "success": true,
+  "region": "southeastasia",
+  "token": "eyJ...",
+  "expiry": 1700000000000,
+  "priority": 1,
+  "remainingMinutes": 18,
+  "remainingSeconds": 30
+}
+```
+
+**响应（失败）**：
+
+```json
+{
+  "success": false,
+  "error": "未获取可用的token",
+  "message": "无法从微软接口获取 token",
+  "timestamp": "2024-01-01T00:00:00.000Z"
+}
+```
+
+**响应（鉴权失败）**：
+
+```json
+{
+  "success": false,
+  "error": "认证失败"
+}
+```
+（HTTP 401）
+
+### 在 TTS Worker 中配置
+
+在 TTS Worker 的 `REMOTETOKEN` 中添加 token-worker 节点：
+
+```
+token-node https://your-token-worker.workers.dev/get-token token-secret-abc
+```
+
+| 列 | 值 | 说明 |
+|---|---|---|
+| `name` | `token-node` | 任意标识，需与 TTS Worker 的 `WORKER_NODE_ID` 不同（避免回环误判） |
+| `url` | `https://your-token-worker.workers.dev/get-token` | token-worker 的 `/get-token` 完整地址 |
+| `api_key` | `token-secret-abc` | **等于** token-worker 的 `env.API_KEY` |
+
+> ⚠️ **注意**：
+> - 该行的 `api_key` 必须与 token-worker 的 `API_KEY` 相同；
+> - 它与 TTS Worker 自身的 `API_KEY`（对外 `/tts` 用）**无关**，可以是不同值；
+> - token-worker 不参与 HMAC 鉴权，TTS Worker 的 `getTokenFromRemoteService` 会发送 `X-Node-Id`/`X-Auth`/`X-TS`，但 token-worker 忽略这些头，只校验 `X-API-Key`。**两者兼容**。
+
+### 与主 `worker.js` 的差异对照
+
+| 项 | `worker.js` | `token-worker.js` |
+|---|---|---|
+| 区域数 | 9 | **5（仅前 5 级）** |
+| 鉴权 | `X-Node-Id` 白名单 + `X-Auth` HMAC + `X-TS` + `X-API-Key` + 限流 | **仅 `X-API-Key`** |
+| 缓存 | 内存 + D1 | **无**（每次直接拉微软） |
+| 回环阻断 | 有 | **无**（无远程互调） |
+| D1 依赖 | 有 | **无** |
+| CORS | 无 | **有** |
+| 定时刷新 | 有（`scheduled`） | **无** |
+
+### 验证
+
+```bash
+# 正确 API Key（token-worker 自己的 key）
+curl -H "X-API-Key: token-secret-abc" https://your-token-worker.workers.dev/get-token
+
+# 预期
+# {"success":true,"region":"southeastasia","token":"...","priority":1,...}
+```
+
+```bash
+# 错误 API Key
+curl -H "X-API-Key: wrong" https://your-token-worker.workers.dev/get-token
+
+# 预期
+# HTTP 401 {"success":false,"error":"认证失败"}
+```
+
+### 注意事项
+
+1. **不要**在 token-worker 中配置 `WORKER_NODE_ID`/`WORKER_SHARED_SECRET`（它不使用）
+2. **不要**把 token-worker 加入自身 `REMOTETOKEN`（避免自调用）
+3. token-worker 的 `API_KEY` 与 TTS Worker 自身 `API_KEY` **无关**；它只需与 TTS Worker `REMOTETOKEN` 中对应行的 `api_key` 字段相同
+4. token-worker 无缓存，高频调用会频繁拉微软，建议 TTS Worker 侧做好缓存（主 `worker.js` 已实现）
+
 ---
 
 ## 安全说明
@@ -331,8 +559,19 @@ A：可以，但 Variables 在 GitHub 日志/Settings 中明文可见。`API_KEY
 **Q：方式二能否自动创建 D1？**
 A：不能。Dashboard 的 Git 集成不支持构建时创建 D1，需手动创建后填 `database_id`。
 
+**Q：token-worker 能否独立部署？**
+A：可以。它本身就是完整的 Worker 代码，单独 deploy 后即可作为独立的 token 服务节点，供 TTS Worker 调用。
+
+**Q：token-worker 和 TTS Worker 必须共用 D1 吗？**
+A：不需要。token-worker 无 D1 依赖，完全无状态。
+
+**Q：token-worker 的 `API_KEY` 必须与 TTS Worker 的 `API_KEY` 相同吗？**
+A：不需要。token-worker 的 `API_KEY` 只用于校验 TTS Worker 调用 `/get-token` 时携带的 `X-API-Key`。TTS Worker 在 `REMOTETOKEN` 中对应行填入这个 key 即可。它与 TTS Worker 自身对外 `/tts` 用的 `API_KEY` 无关，可以是不同值。
+
 ---
 
 ## License
 
-MIT
+GNU Affero General Public License v3.0
+
+本项目采用 [AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.html) 许可。任何修改后的版本若通过网络提供服务，必须以相同许可开源。
