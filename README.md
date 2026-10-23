@@ -1,0 +1,338 @@
+# Microsoft TTS Worker
+
+基于 Cloudflare Workers 的 Microsoft TTS 代理服务，支持多节点 token 池共享、SSML 注入防护、节点间 HMAC 鉴权、D1 持久化缓存。
+
+## 特性
+
+- 🎙️ **多语音/多风格**：从微软官方语音列表动态生成端点表，支持中文全系列语音
+- 🔗 **多节点 token 池共享**：节点间通过 `/get-token` 互调，HMAC 签名 + 时间戳 + 白名单 + 限流四重鉴权
+- 🛡️ **安全防护**：SSML 注入双重防御、节点鉴权、API Key 恒定时间比较、回环阻断
+- 💾 **D1 持久化**：端点表、token 缓存、语音列表三张表，原子批量写入
+- 🔄 **自动刷新**：`scheduled` 定时刷新端点表，分批并发降低 CPU 峰值
+- 🤖 **OpenAI 兼容**：`/v1/audio/speech` 支持 OpenAI TTS 客户端
+- 🎨 **Web 界面**：内置在线 TTS 试听页
+
+## 路由
+
+| 路径 | 方法 | 说明 |
+|---|---|---|
+| `/` | GET | Web 试听界面 |
+| `/tts`、`/api/v1/tts` | GET/POST | TTS 合成 |
+| `/voices`、`/api/v1/voices` | GET | 语音列表 |
+| `/endpoints` | GET | 端点表状态 |
+| `/health` | GET | 健康检查 |
+| `/v1/audio/speech`、`/audio/speech` | POST | OpenAI 兼容 TTS |
+| `/get-token` | GET | 节点间 token 共享（需 HMAC 签名） |
+| `/reader.json` | GET | 阅读 App 导入配置 |
+| `/reader-post.json` | GET | 阅读 App 导入配置（POST） |
+| `/ifreetime.json` | GET | 爱阅记导入配置 |
+
+---
+
+## 部署方式
+
+提供两种部署方式，任选其一。
+
+### 方式一：GitHub Actions 一键部署（推荐）
+
+全自动：创建 D1、初始化表结构、设置 Secret、部署 Worker。首次配置 GitHub Secrets/Variables 后，push 即全自动。
+
+#### 步骤 1：Fork / Clone 仓库
+
+```bash
+git clone https://github.com/<your-name>/<repo>.git
+cd <repo>
+```
+
+#### 步骤 2：创建 Cloudflare API Token
+
+1. 访问 [Cloudflare Dashboard → API Tokens](https://dash.cloudflare.com/profile/api-tokens)
+2. 使用模板 **Edit Cloudflare Workers**
+3. 额外添加权限：**Account → D1 → Edit**
+4. 复制 Token
+
+同时获取 **Account ID**（Dashboard 右侧栏或 Workers 页面 URL 中）。
+
+#### 步骤 3：配置 GitHub Secrets 和 Variables
+
+进入 GitHub 仓库 → **Settings → Secrets and variables → Actions**：
+
+**Secrets**（敏感信息，日志不可见）：
+
+| Name | 值 |
+|---|---|
+| `CLOUDFLARE_API_TOKEN` | 步骤 2 复制的 Token |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Account ID |
+| `API_KEY` | `openssl rand -hex 32` 生成 |
+| `WORKER_SHARED_SECRET` | `openssl rand -hex 32` 生成 |
+
+**Variables**（明文，日志可见）：
+
+| Name | 示例 |
+|---|---|
+| `WORKER_NODE_ID` | `node-a` |
+| `REMOTETOKEN` | `node-b https://worker-b.example.workers.dev <B的API_KEY>`（单节点留空） |
+
+#### 步骤 4：推送到 main
+
+```bash
+git push origin main
+```
+
+GitHub Actions 自动执行：
+1. ✅ 检查配置
+2. 📦 查询/创建 D1 数据库 `tts-db`
+3. 📝 注入 `database_id` 到 `wrangler.toml`
+4. 🗄️ 初始化表结构
+5. 🔐 设置 Worker Secrets
+6. 🚀 部署 Worker
+
+部署完成后访问 `https://tts-worker.<subdomain>.workers.dev`。
+
+---
+
+### 方式二：Cloudflare Dashboard 连接 Git
+
+在 Cloudflare Dashboard 中连接 GitHub 仓库，push 自动部署。**需一次性手动配置 D1 和 Secret**。
+
+#### 步骤 1：创建 D1 数据库
+
+Cloudflare Dashboard → **Workers & Pages → D1** → Create database → 名称 `tts-db`。
+
+复制 `database_id`，填入仓库 `wrangler.toml`：
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "tts-db"
+database_id = "你的database_id"
+```
+
+提交并推送。
+
+#### 步骤 2：初始化表结构
+
+本地执行（需 `wrangler login`）：
+
+```bash
+npm install
+npx wrangler d1 execute tts-db --remote --file=schema.sql
+```
+
+#### 步骤 3：连接 Git
+
+Cloudflare Dashboard → **Workers & Pages → Create → Connect to Git**：
+
+- 选择你的仓库
+- Build command：留空
+- Deploy command：`npx wrangler deploy`
+
+#### 步骤 4：设置 Secrets
+
+部署后，Worker → **Settings → Variables and Secrets** → Add：
+
+| Name | Type | 值 |
+|---|---|---|
+| `API_KEY` | Secret | `openssl rand -hex 32` |
+| `WORKER_SHARED_SECRET` | Secret | `openssl rand -hex 32` |
+
+同时确认 `[vars]` 中的 `WORKER_NODE_ID`、`REMOTETOKEN` 正确。
+
+#### 步骤 5：重新部署
+
+Dashboard 中 Trigger deploy，或 push 一次提交。
+
+---
+
+## 两种部署方式对比
+
+| 项 | 方式一（GitHub Actions） | 方式二（Dashboard 连接 Git） |
+|---|---|---|
+| D1 自动创建 | ✅ | ❌ 需手动创建后填 ID |
+| D1 schema 自动初始化 | ✅ | ❌ 需手动执行 |
+| Secret 自动设置 | ✅ | ❌ 需手动在 Dashboard 设置 |
+| GitHub 配置量 | Secrets 4 个 + Variables 2 个 | 无 |
+| 推送自动部署 | ✅ | ✅ |
+| 适合 | 团队/多环境/CI 标准化 | 个人快速上手 |
+
+**推荐方式一**，一次配置后全自动。
+
+---
+
+## 环境变量
+
+### 明文变量（`wrangler.toml` 的 `[vars]`）
+
+| 变量 | 必填 | 说明 | 示例 |
+|---|---|---|---|
+| `WORKER_NODE_ID` | ✅ | 本节点唯一标识，多节点必须不同 | `node-a` |
+| `REMOTETOKEN` | ✅ | 远程节点列表，每行 `name url api_key`，`name` 为对方 `WORKER_NODE_ID` | `node-b https://worker-b.workers.dev sk-bbb` |
+
+### Secret
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `API_KEY` | ✅ | 对外 API Key，多节点必须相同 |
+| `WORKER_SHARED_SECRET` | ✅ | 节点间 HMAC 签名密钥，多节点必须相同，≥32 字节随机串 |
+
+### 生成随机密钥
+
+```bash
+openssl rand -hex 32
+```
+
+---
+
+## 多节点部署
+
+两个 Worker 共享 token 池，需保证：
+
+| 变量 | 节点 A | 节点 B |
+|---|---|---|
+| `WORKER_NODE_ID` | `node-a` | `node-b` |
+| `API_KEY` | **相同** | **相同** |
+| `WORKER_SHARED_SECRET` | **相同** | **相同** |
+| `REMOTETOKEN` | `node-b https://worker-b.workers.dev <B的API_KEY>` | `node-a https://worker-a.workers.dev <A的API_KEY>` |
+
+两节点共用同一个 D1 数据库（`database_id` 相同）。
+
+部署方式：
+
+- **方式一**：两个仓库（或同仓库两 branch），各自配置 GitHub Variables 的 `WORKER_NODE_ID`、`REMOTETOKEN`，`API_KEY`/`WORKER_SHARED_SECRET` 相同。
+- **方式二**：两个 Worker 连接同一仓库不同分支，或手动 deploy 两次改 `WORKER_NODE_ID`。
+
+---
+
+## 使用示例
+
+### cURL
+
+```bash
+curl -X POST https://<worker>.workers.dev/tts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "api_key": "your-api-key",
+    "text": "你好，世界",
+    "voice": "zh-CN-XiaoxiaoNeural",
+    "style": "cheerful",
+    "rate": 0,
+    "pitch": 0
+  }' --output audio.mp3
+```
+
+### OpenAI SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://<worker>.workers.dev/v1",
+    api_key="your-api-key"
+)
+
+response = client.audio.speech.create(
+    model="tts-1",
+    voice="alloy",
+    input="Hello, world"
+)
+response.stream_to_file("output.mp3")
+```
+
+---
+
+## 数据库表结构
+
+见 `schema.sql`，包含三张表：
+
+- `endpoint_table`：区域端点表（region, priority, voices_data）
+- `token_cache`：token 缓存（region, token, expiry, priority）
+- `voice_list`：合并语音列表（voice_name, voice_data）
+
+---
+
+## 定时刷新
+
+`wrangler.toml` 中配置：
+
+```toml
+[triggers]
+crons = ["0 */6 * * *"]  # 每 6 小时
+```
+
+`scheduled` 会重新拉取微软语音列表并写入 D1。
+
+---
+
+## 本地开发
+
+```bash
+# 安装依赖
+npm install
+
+# 本地 D1 初始化
+npx wrangler d1 execute tts-db --local --file=schema.sql
+
+# 启动本地开发服务器
+npm run dev
+
+# 查看远程日志
+npm run tail
+```
+
+---
+
+## 架构说明
+
+```
+┌─────────────┐         /get-token          ┌─────────────┐
+│  Worker A   │ ◄─────────────────────────► │  Worker B   │
+│  node-a     │   HMAC + TS + NodeId        │  node-b     │
+└──────┬──────┘                             └──────┬──────┘
+       │                                           │
+       └──────────────┬────────────────────────────┘
+                      ▼
+              ┌───────────────┐
+              │  D1 Database  │
+              │  共享 token 池 │
+              └───────────────┘
+```
+
+- 每个 Worker 维护内存 token 缓存
+- 本地无可用 token 时，通过 `/get-token` 向对方节点请求
+- 对方节点返回 token，写入本地缓存和 D1
+- 回环检测：A 调 B 后，B 记录"A 刚调过我"，B 反向调 A 时跳过
+
+---
+
+## 安全说明
+
+- `API_KEY`、`WORKER_SHARED_SECRET` 用 Secret 存储，不入仓库
+- `/get-token` 四重鉴权：`X-Node-Id` 白名单 + `X-Auth` HMAC + `X-TS` 时间窗 + `X-API-Key`
+- SSML 注入防护：voice/style 白名单 + 正则格式校验 + 内部断言
+- 节点限流：每节点 30 次/分钟
+- 回环阻断：3 分钟
+
+---
+
+## 常见问题
+
+**Q：方式一 D1 已存在会重复创建吗？**
+A：不会。Workflow 先 `wrangler d1 list --json` 查询，存在则复用 `uuid`，不存在才创建。
+
+**Q：`REMOTETOKEN` 多行如何放 GitHub Variables？**
+A：直接粘贴多行字符串，GitHub Variables 支持换行。
+
+**Q：多节点如何用方式一部署？**
+A：每个节点一个仓库 fork（或同仓库不同 branch），各自配置 `WORKER_NODE_ID` 和 `REMOTETOKEN`，`API_KEY`/`WORKER_SHARED_SECRET` 相同，共用同一 D1。
+
+**Q：Secret 能否用 GitHub Variables 代替？**
+A：可以，但 Variables 在 GitHub 日志/Settings 中明文可见。`API_KEY`/`WORKER_SHARED_SECRET` 必须用 Secrets。
+
+**Q：方式二能否自动创建 D1？**
+A：不能。Dashboard 的 Git 集成不支持构建时创建 D1，需手动创建后填 `database_id`。
+
+---
+
+## License
+
+MIT
