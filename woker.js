@@ -511,6 +511,7 @@ async function getDynamicToken() {
 }
 
 // 刷新 token（内部实现，不做单飞；调用方负责单飞）
+// 设计：无论本地直连还是远程，匹配成功均写 tokenCache + D1，供后续复用
 async function refreshToken(DB, voiceName, style) {
   console.log('🔄 开始刷新token');
 
@@ -581,6 +582,7 @@ async function refreshToken(DB, voiceName, style) {
   return null;
 }
 
+// 单飞刷新：同一时刻只有一个 refreshToken 在执行
 let refreshPromise = null;
 
 function ensureRefresh(DB, voiceName, style) {
@@ -591,6 +593,7 @@ function ensureRefresh(DB, voiceName, style) {
   return refreshPromise;
 }
 
+// 获取最佳 token
 async function getBestToken(DB, voiceName, style) {
   const now = Date.now();
   const TOKEN_REFRESH_THRESHOLD = 5 * 60 * 1000;
@@ -850,7 +853,6 @@ async function getVoice(DB, text, voiceName, rate, pitch, style, outputFormat, d
     'X-Microsoft-OutputFormat': outputFormat
   };
 
-  // ⚠️-1：getSsml 抛错捕获，转 400
   let ssml;
   try {
     ssml = getSsml(text, voiceName, rate, pitch, style);
@@ -928,7 +930,6 @@ async function sign(urlStr) {
   const formattedDate = dateFormat();
   const bytesToSign = `MSTranslatorAndroidApp${encodedUrl}${formattedDate}${uuidStr}`.toLowerCase();
 
-  // ⚠️-8：decode 缓存
   if (!_signKeyCache) {
     _signKeyCache = await base64ToBytes('oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw==');
   }
@@ -1433,7 +1434,6 @@ async function handleRequest(request, env) {
       });
     }
 
-    // ⚠️-2：无可用 token 返回 503 + Retry-After
     return new Response(JSON.stringify({
       success: false,
       error: 'No matching token available, retry later'
