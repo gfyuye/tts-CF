@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  tts-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: tts-worker
+    ports:
+      - "8787:8787"
+    environment:
+      - API_KEY=${API_KEY:-dev-api-key}
+      - WORKER_SHARED_SECRET=${WORKER_SHARED_SECRET:-dev-shared-secret}
+      - WORKER_NODE_ID=${WORKER_NODE_ID:-node-a}
+      - REMOTETOKEN=${REMOTETOKEN:-}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
