@@ -218,7 +218,35 @@ function getRemoteServices() {
     return services;
   }
 
-  for (const line of remoteTokenConfig.split(/\r?\n/)) {
+  let raw = remoteTokenConfig;
+
+  // 容错 1：字面量 \n 转真实换行
+  if (raw.includes('\\n') && !raw.includes('\n')) {
+    console.warn('⚠️ REMOTETOKEN 含字面量 \\n，自动转换');
+    raw = raw.replace(/\\n/g, '\n');
+  }
+
+  // 容错 2：单行含多个 url 时按边界拆分（每节点必有 apiKey，正则可靠）
+  const urlCount = (raw.match(/https?:\/\//g) || []).length;
+  let lines;
+
+  if (urlCount > 1 && !raw.includes('\n')) {
+    console.warn(`⚠️ REMOTETOKEN 单行含 ${urlCount} 个 url 但无换行，配置可能被吞换行，尝试拆分`);
+    const re = /(\S+)\s+(https?:\/\/\S+)\s+(\S+)/g;
+    lines = [];
+    let m;
+    while ((m = re.exec(raw)) !== null) {
+      lines.push(`${m[1]} ${m[2]} ${m[3]}`);
+    }
+    if (lines.length !== urlCount) {
+      console.warn(`⚠️ 正则拆分数量(${lines.length})与 url 数量(${urlCount})不一致，回退逐行处理。请检查配置，每行一条。`);
+      lines = raw.split(/\r?\n/);
+    }
+  } else {
+    lines = raw.split(/\r?\n/);
+  }
+
+  for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
 
@@ -229,13 +257,38 @@ function getRemoteServices() {
     }
 
     const [name, url, apiKey = ''] = parts;
-    services.push({ url, apiKey, marker: name });
+
+    if (!/^https?:\/\//i.test(url)) {
+      console.warn(`⚠️ REMOTETOKEN url 非法（需 http:// 或 https://），已跳过: "${trimmed}"`);
+      continue;
+    }
+    try {
+      new URL(url);
+    } catch {
+      console.warn(`⚠️ REMOTETOKEN url 无法解析，已跳过: "${url}"`);
+      continue;
+    }
+
+    if (/^https?:\/\//i.test(name)) {
+      console.warn(`⚠️ REMOTETOKEN name 异常（疑似拆分错误），已跳过: "${trimmed}"`);
+      continue;
+    }
+
+    if (!apiKey) {
+      console.warn(`⚠️ REMOTETOKEN 节点 "${name}" 缺少 apiKey，鉴权将失败`);
+    }
+
+    services.push({ url, apiKey: apiKey.trim(), marker: name });
   }
+
+  console.log(`📋 REMOTETOKEN 解析完成: ${services.length} 个远程节点`);
+  services.forEach((s, i) => {
+    console.log(`  [${i + 1}] ${s.marker} -> ${s.url} (apiKey: ${s.apiKey ? '***' : '空'})`);
+  });
 
   remoteServicesCache = services;
   return services;
 }
-
 // ============ 远程获取 token ============
 
 async function getTokenFromRemoteService(service) {
@@ -1007,7 +1060,6 @@ async function initialize(env) {
       remoteServicesCache = null;
       workerNodeId = env.WORKER_NODE_ID || '';
       nodeSharedSecret = env.WORKER_SHARED_SECRET || '';
-
       if (!workerNodeId) console.warn('⚠️ WORKER_NODE_ID 未配置，/get-token 将拒绝所有请求');
       if (!nodeSharedSecret) console.warn('⚠️ WORKER_SHARED_SECRET 未配置，/get-token 将返回 500');
       if (!env.API_KEY) console.warn('⚠️ API_KEY 未配置，所有 /tts 请求将 401');
