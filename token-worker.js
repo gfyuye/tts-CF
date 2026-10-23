@@ -1,5 +1,6 @@
 // ============================================================
-// Token 获取模块（完全自包含，可复制到任何 Worker）
+// Token 获取模块（独立自包含，可复制到任何 Worker）
+//
 // 使用方法：
 // 1. 在 fetch 函数开头插入：
 //    const path = new URL(request.url).pathname;
@@ -8,73 +9,111 @@
 //    }
 // 2. 将本模块代码粘贴到文件末尾
 // 3. 在环境变量中配置 API_KEY
+//
+// 设计说明：
+//   - 仅保留前 5 级优先级（southeastasia/eastus/westeurope/westus2/eastasia）
+//   - 后 4 级（westus/centralindia/northeurope/japaneast）不在此模块请求
+//     原因：主 worker 若只拿到后 4 级，说明前 5 级不可用，
+//           向远方获取同样只有后 4 级，无增量价值
+//   - API Key 恒定时间比较
+//   - API Key 未配置时拒绝（与主 worker.js 行为一致）
+//   - 保留 CORS 与 Cache-Control（其他 Worker 可能需要）
 // ============================================================
-
 
 // ============================================================
 // token-worker模块开始
 // ============================================================
+
+// Token 优先级（仅前 5 级，与主 worker.js 的前 5 级一致）
+const TOKEN_WORKER_PRIORITY = [
+  { region: 'southeastasia', priority: 1 },
+  { region: 'eastus', priority: 2 },
+  { region: 'westeurope', priority: 3 },
+  { region: 'westus2', priority: 4 },
+  { region: 'eastasia', priority: 5 }
+];
+
+// 前 N 级优先返回（本模块 5 个区域全部优先）
+const TOKEN_WORKER_TOP_PRIORITY = 5;
+
+// 恒定时间字符串比较
+function tokenWorkerTimingSafeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
 async function handleGetToken(request, env) {
-  // ============ API Key 验证 ============
-  const apiKey = request.headers.get('X-API-Key') || 
-                 new URL(request.url).searchParams.get('api_key') || 
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-API-Key',
+    'Cache-Control': 'no-store'
+  };
+
+  // ============ CORS 预检 ============
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
+  // ============ API Key 验证（恒定时间比较，未配置则拒绝） ============
+  const apiKey = request.headers.get('X-API-Key') ||
+                 new URL(request.url).searchParams.get('api_key') ||
                  '';
-  
+
   const expectedApiKey = env.API_KEY || '';
-  
+
   if (!expectedApiKey) {
-    console.log('⚠️ 未配置 API_KEY，允许所有请求');
-  } else if (apiKey !== expectedApiKey) {
+    console.error('❌ 未配置 API_KEY，拒绝所有请求（与主 worker.js 行为一致）');
+    return new Response(JSON.stringify({
+      success: false,
+      error: 'Server misconfigured: API_KEY not set'
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+
+  if (!tokenWorkerTimingSafeEqual(apiKey, expectedApiKey)) {
     console.warn('❌ API Key 验证失败');
     return new Response(JSON.stringify({
       success: false,
       error: '认证失败'
     }), {
       status: 401,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      }
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
     });
   }
-  
+
   console.log('🔑 token服务API Key 验证通过');
-  
-  // ============ Token 优先级表 ============
-  const TOKEN_PRIORITY = [
-    { region: 'southeastasia', priority: 1 },
-    { region: 'eastus', priority: 2 },
-    { region: 'westeurope', priority: 3 },
-    { region: 'westus2', priority: 4 },
-    { region: 'eastasia', priority: 5 }
-  ];
-  
+
   // ============ 工具函数 ============
-  
+
   function uuid() {
-    return crypto.randomUUID().replace(/-/g, '')
+    return crypto.randomUUID().replace(/-/g, '');
   }
-  
+
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
-  
+
   function generateUserId() {
     const chars = 'abcdef0123456789';
     let result = '';
     for (let i = 0; i < 16; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
     return result;
   }
-  
+
   function dateFormat() {
     return new Date().toUTCString().replace(/GMT/, '').trim().toLowerCase() + 'gmt';
   }
-  
+
   function getPriority(region) {
-    const item = TOKEN_PRIORITY.find(p => p.region === region);
+    const item = TOKEN_WORKER_PRIORITY.find(p => p.region === region);
     return item ? item.priority : 99;
   }
-  
+
   function decodeJwtPayload(token) {
     try {
       const parts = token.split('.');
@@ -82,48 +121,53 @@ async function handleGetToken(request, env) {
       const payload = parts[1];
       const padded = payload.replace(/-/g, '+').replace(/_/g, '/');
       const padding = '='.repeat((4 - padded.length % 4) % 4);
-      const decoded = atob(padded + padding);
-      return JSON.parse(decoded);
+      return JSON.parse(atob(padded + padding));
     } catch (error) {
       return null;
     }
   }
-  
+
   async function hmacSha256(key, data) {
     const cryptoKey = await crypto.subtle.importKey(
       'raw', key,
-      { name: 'HMAC', hash: { name: 'SHA-256' } },
+      { name: 'HMAC', hash: 'SHA-256' },
       false, ['sign']
     );
     const signature = await crypto.subtle.sign('HMAC', cryptoKey, new TextEncoder().encode(data));
     return new Uint8Array(signature);
   }
-  
+
   async function base64ToBytes(base64) {
     const binaryString = atob(base64);
     const bytes = new Uint8Array(binaryString.length);
     for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
     return bytes;
   }
-  
+
   async function bytesToBase64(bytes) {
     return btoa(String.fromCharCode.apply(null, bytes));
   }
-  
+
+  // 模块级缓存 sign 用的 HMAC key
+  let _signKeyCache = null;
+
   async function sign(urlStr) {
     const url = urlStr.split('://')[1];
     const encodedUrl = encodeURIComponent(url);
     const uuidStr = uuid();
     const formattedDate = dateFormat();
     const bytesToSign = `MSTranslatorAndroidApp${encodedUrl}${formattedDate}${uuidStr}`.toLowerCase();
-    const decode = await base64ToBytes('oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw==');
-    const signData = await hmacSha256(decode, bytesToSign);
+
+    if (!_signKeyCache) {
+      _signKeyCache = await base64ToBytes('oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw==');
+    }
+    const signData = await hmacSha256(_signKeyCache, bytesToSign);
     const signBase64 = await bytesToBase64(signData);
     return `MSTranslatorAndroidApp::${signBase64}::${formattedDate}::${uuidStr}`;
   }
-  
+
   // ============ 获取动态 token ============
-  
+
   async function getDynamicToken() {
     try {
       const endpointUrl = 'https://dev.microsofttranslator.com/apps/endpoint?api-version=1.0';
@@ -139,16 +183,16 @@ async function handleGetToken(request, env) {
         'Content-Length': '0',
         'Accept-Encoding': 'gzip'
       };
-      
+
       const response = await fetch(endpointUrl, { method: 'POST', headers: headers });
-      
+
       if (response.ok) {
         const data = await response.json();
         const jwtPayload = decodeJwtPayload(data.t);
-        
+
         let actualRegion = data.r || 'unknown';
         let tokenExpiry = Date.now() + 20 * 60 * 1000;
-        
+
         if (jwtPayload) {
           if (jwtPayload.exp) tokenExpiry = jwtPayload.exp * 1000;
           if (jwtPayload.aud) {
@@ -156,10 +200,10 @@ async function handleGetToken(request, env) {
             if (audMatch) actualRegion = audMatch[1];
           }
         }
-        
-        return { 
-          region: actualRegion, 
-          token: data.t, 
+
+        return {
+          region: actualRegion,
+          token: data.t,
           expiry: tokenExpiry,
           priority: getPriority(actualRegion)
         };
@@ -170,33 +214,33 @@ async function handleGetToken(request, env) {
       return null;
     }
   }
-  
-  // ============ 刷新 token（前5级直接返回，3次后返回当前token） ============
-  
+
+  // ============ 刷新 token（前 5 级优先返回，最多 3 次） ============
+
   async function refreshToken() {
-    console.log('🔄 开始获取token（前5级优先）');
-    
+    console.log(`🔄 开始获取token（前${TOKEN_WORKER_TOP_PRIORITY}级优先）`);
+
     const MAX_ATTEMPTS = 3;
     let lastToken = null;
-    
+
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       const tokenData = await getDynamicToken();
-      
+
       if (!tokenData) {
         console.log(`  第${attempt + 1}次: 获取失败`);
-        await sleep(1000);
+        if (attempt < MAX_ATTEMPTS - 1) await sleep(1000);
         continue;
       }
-      
+
       lastToken = tokenData;
-      
+
       const priority = tokenData.priority;
       const region = tokenData.region;
-      const remainingMs = tokenData.expiry - Date.now();
+      const remainingMs = Math.max(0, tokenData.expiry - Date.now());
       const remainingMinutes = Math.floor(remainingMs / 60000);
-      const remainingSeconds = Math.round((remainingMs % 60000) / 1000);
-      
-      if (priority <= 5) {
+      const remainingSeconds = Math.min(59, Math.floor((remainingMs % 60000) / 1000));
+
+      if (priority <= TOKEN_WORKER_TOP_PRIORITY) {
         console.log(`  ✅ 获取token: ${region}(P${priority}, ${remainingMinutes}分${remainingSeconds}秒)`);
         return {
           success: true,
@@ -208,20 +252,20 @@ async function handleGetToken(request, env) {
           remainingSeconds
         };
       }
-      
-      console.log(`  第${attempt + 1}次: 弃用 ${region}(P${priority})，不在前5级`);
-      await sleep(1000);
+
+      console.log(`  第${attempt + 1}次: 弃用 ${region}(P${priority})，不在前${TOKEN_WORKER_TOP_PRIORITY}级`);
+      if (attempt < MAX_ATTEMPTS - 1) await sleep(1000);
     }
-    
+
     if (lastToken) {
       const priority = lastToken.priority;
       const region = lastToken.region;
-      const remainingMs = lastToken.expiry - Date.now();
+      const remainingMs = Math.max(0, lastToken.expiry - Date.now());
       const remainingMinutes = Math.floor(remainingMs / 60000);
-      const remainingSeconds = Math.round((remainingMs % 60000) / 1000);
-      
-      console.log(`  ⚠️ 3次后返回最后token: ${region}(P${priority}, ${remainingMinutes}分${remainingSeconds}秒)`);
-      
+      const remainingSeconds = Math.min(59, Math.floor((remainingMs % 60000) / 1000));
+
+      console.log(`  ⚠️ ${MAX_ATTEMPTS}次后返回最后token: ${region}(P${priority}, ${remainingMinutes}分${remainingSeconds}秒)`);
+
       return {
         success: true,
         region: region,
@@ -232,29 +276,23 @@ async function handleGetToken(request, env) {
         remainingSeconds
       };
     }
-    
-    console.error('❌ 3次尝试后仍无可用token');
+
+    console.error(`❌ ${MAX_ATTEMPTS}次尝试后仍无可用token`);
     return {
       success: false,
       error: '未获取可用的token',
-      message: '无法从本地或远程获取匹配的token',
+      message: '无法从微软接口获取 token',
       timestamp: new Date().toISOString()
     };
   }
-  
+
   // ============ 主逻辑 ============
-  
+
   const result = await refreshToken();
-  
+
   return new Response(JSON.stringify(result), {
     status: result.success ? 200 : 500,
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-      'Cache-Control': 'no-store'
-    }
+    headers: { 'Content-Type': 'application/json', ...corsHeaders }
   });
 }
 
