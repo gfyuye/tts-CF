@@ -12,6 +12,7 @@
 - 🤖 **OpenAI 兼容**：`/v1/audio/speech` 支持 OpenAI TTS 客户端
 - 🎨 **Web 界面**：内置在线 TTS 试听页
 - 🧩 **独立 token-worker**：附带可插入任意 Worker 的轻量 token 获取模块
+- 🐳 **Docker 自托管**：附带 Node.js + JSON D1 模拟的 Docker 部署方案（可选）
 
 ## 路由
 
@@ -40,16 +41,33 @@
 ├── package.json
 ├── .gitignore
 ├── LICENSE                   # AGPL-3.0
-└── .github/
-    └── workflows/
-        └── deploy.yml
+├── .github/
+│   └── workflows/
+│       └── deploy.yml
+└── docker/                   # Docker 自托管（可选，与主代码隔离）
+    ├── README.md
+    ├── Dockerfile
+    ├── docker-compose.yml
+    ├── .dockerignore
+    ├── .env.example
+    ├── package.json
+    ├── server.js
+    ├── d1-json.js
+    └── data/
+        └── .gitkeep
 ```
 
 ---
 
 ## 部署方式
 
-提供两种部署方式，任选其一。
+提供三种部署方式，任选其一。
+
+| 方式 | 适合 | 依赖 Cloudflare |
+|---|---|---|
+| **方式一：GitHub Actions** | 团队/多环境/CI 标准化 | ✅ |
+| **方式二：Dashboard 连接 Git** | 个人快速上手 | ✅ |
+| **方式三：Docker 自托管** | 本地开发/测试/单实例 | ❌ |
 
 ### 方式一：GitHub Actions 一键部署（推荐）
 
@@ -163,18 +181,45 @@ Dashboard 中 Trigger deploy，或 push 一次提交。
 
 ---
 
-### 两种部署方式对比
+### 方式三：Docker 自托管（可选，不依赖 Cloudflare）
 
-| 项 | 方式一（GitHub Actions） | 方式二（Dashboard 连接 Git） |
-|---|---|---|
-| D1 自动创建 | ✅ | ❌ 需手动创建后填 ID |
-| D1 schema 自动初始化 | ✅ | ❌ 需手动执行 |
-| Secret 自动设置 | ✅ | ❌ 需手动在 Dashboard 设置 |
-| GitHub 配置量 | Secrets 4 个 + Variables 2 个 | 无 |
-| 推送自动部署 | ✅ | ✅ |
-| 适合 | 团队/多环境/CI 标准化 | 个人快速上手 |
+用 Node.js + JSON 模拟 D1 运行 `worker.js`，**完全脱离 Cloudflare**，适合本地开发、测试、单实例自托管。
 
-**推荐方式一**，一次配置后全自动。
+详见 [`docker/README.md`](./docker/README.md)。
+
+```bash
+cd docker
+cp .env.example .env   # 编辑填入 API_KEY / WORKER_SHARED_SECRET
+docker compose up -d --build
+curl http://localhost:8787/health
+```
+
+**局限**：
+
+- 单实例，JSON 文件不支持多容器并发写
+- `scheduled` 用 `setInterval` 模拟（每 6 小时）
+- 无 Cloudflare 边缘信息（`request.cf.colo = 'docker'`）
+- 仅支持 `worker.js` 用到的 SQL 子集
+
+**适用场景**：本地开发、测试、家庭服务器、单实例内网服务。
+
+**生产环境推荐方式一或方式二**（Cloudflare 部署，D1 托管，自动扩展）。
+
+---
+
+### 三种部署方式对比
+
+| 项 | 方式一（GitHub Actions） | 方式二（Dashboard 连接 Git） | 方式三（Docker） |
+|---|---|---|---|
+| D1 自动创建 | ✅ | ❌ 需手动创建 | ❌ JSON 模拟 |
+| D1 schema 自动初始化 | ✅ | ❌ 需手动执行 | ✅ JSON 自动 |
+| Secret 自动设置 | ✅ | ❌ 需手动在 Dashboard | ✅ 环境变量 |
+| 依赖 Cloudflare | ✅ | ✅ | ❌ |
+| 多实例 | ✅ | ✅ | ❌ 单实例 |
+| 边缘加速 | ✅ | ✅ | ❌ |
+| 定时任务 | ✅ `scheduled` | ✅ `scheduled` | ⚠️ `setInterval` 模拟 |
+| GitHub 配置量 | Secrets 4 + Variables 2 | 无 | 无 |
+| 适合 | 团队/CI | 个人快速 | 本地/测试/单实例 |
 
 ---
 
@@ -186,6 +231,8 @@ Dashboard 中 Trigger deploy，或 push 一次提交。
 |---|---|---|---|
 | `WORKER_NODE_ID` | ✅ | 本节点唯一标识，多节点必须不同 | `node-a` |
 | `REMOTETOKEN` | ✅ | 远程节点列表，每行 `name url api_key`，`name` 为对方 `WORKER_NODE_ID` | `node-b https://worker-b.workers.dev sk-bbb` |
+
+> `REMOTETOKEN` **必须每行一条**。若环境变量平台吞换行，代码会自动按 `https://` 边界拆分并告警，但建议修正配置。
 
 ### Secret
 
@@ -199,6 +246,10 @@ Dashboard 中 Trigger deploy，或 push 一次提交。
 ```bash
 openssl rand -hex 32
 ```
+
+### Docker 环境变量
+
+方式三使用 `.env` 文件（见 `docker/.env.example`），变量同上。
 
 ---
 
@@ -219,6 +270,7 @@ openssl rand -hex 32
 
 - **方式一**：两个仓库（或同仓库两 branch），各自配置 GitHub Variables 的 `WORKER_NODE_ID`、`REMOTETOKEN`，`API_KEY`/`WORKER_SHARED_SECRET` 相同。
 - **方式二**：两个 Worker 连接同一仓库不同分支，或手动 deploy 两次改 `WORKER_NODE_ID`。
+- **方式三**：启动两个 Docker 容器，各自的 `.env` 配置 `WORKER_NODE_ID` 和 `REMOTETOKEN`，**不能共用 `data/db.json`**（单实例限制）。
 
 ---
 
@@ -267,22 +319,28 @@ response.stream_to_file("output.mp3")
 - `token_cache`：token 缓存（region, token, expiry, priority）
 - `voice_list`：合并语音列表（voice_name, voice_data）
 
+Docker 方式下由 `docker/d1-json.js` 用 JSON 文件模拟，结构一致。
+
 ---
 
 ## 定时刷新
 
-`wrangler.toml` 中配置：
+Cloudflare 方式在 `wrangler.toml` 中配置：
 
 ```toml
 [triggers]
 crons = ["0 */6 * * *"]  # 每 6 小时
 ```
 
-`scheduled` 会重新拉取微软语音列表并写入 D1。
+Docker 方式由 `docker/server.js` 的 `setInterval` 模拟，同样每 6 小时。
+
+`scheduled` 会重新拉取微软语音列表并写入存储。
 
 ---
 
 ## 本地开发
+
+### Cloudflare 方式
 
 ```bash
 # 安装依赖
@@ -296,6 +354,15 @@ npm run dev
 
 # 查看远程日志
 npm run tail
+```
+
+### Docker 方式
+
+```bash
+cd docker
+cp .env.example .env
+docker compose up -d --build
+docker compose logs -f
 ```
 
 ---
@@ -539,6 +606,7 @@ curl -H "X-API-Key: wrong" https://your-token-worker.workers.dev/get-token
 - SSML 注入防护：voice/style 白名单 + 正则格式校验 + 内部断言
 - 节点限流：每节点 30 次/分钟
 - 回环阻断：3 分钟
+- Docker 方式：`docker/.env` 不入库，`docker/data/db.json` 含 token 缓存，注意文件权限
 
 ---
 
@@ -548,7 +616,7 @@ curl -H "X-API-Key: wrong" https://your-token-worker.workers.dev/get-token
 A：不会。Workflow 先 `wrangler d1 list --json` 查询，存在则复用 `uuid`，不存在才创建。
 
 **Q：`REMOTETOKEN` 多行如何放 GitHub Variables？**
-A：直接粘贴多行字符串，GitHub Variables 支持换行。
+A：直接粘贴多行字符串，GitHub Variables 支持换行。若被吞换行，代码会自动按 `https://` 边界拆分并告警。
 
 **Q：多节点如何用方式一部署？**
 A：每个节点一个仓库 fork（或同仓库不同 branch），各自配置 `WORKER_NODE_ID` 和 `REMOTETOKEN`，`API_KEY`/`WORKER_SHARED_SECRET` 相同，共用同一 D1。
@@ -568,6 +636,18 @@ A：不需要。token-worker 无 D1 依赖，完全无状态。
 **Q：token-worker 的 `API_KEY` 必须与 TTS Worker 的 `API_KEY` 相同吗？**
 A：不需要。token-worker 的 `API_KEY` 只用于校验 TTS Worker 调用 `/get-token` 时携带的 `X-API-Key`。TTS Worker 在 `REMOTETOKEN` 中对应行填入这个 key 即可。它与 TTS Worker 自身对外 `/tts` 用的 `API_KEY` 无关，可以是不同值。
 
+**Q：Docker 方式能否连接远程 D1？**
+A：不能。Docker 方式用 JSON 文件模拟 D1，完全本地。若需远程 D1，只能部署到 Cloudflare。
+
+**Q：Docker 方式能否多实例？**
+A：不能。JSON 文件不支持多容器并发写，只能单实例。多实例请用 Cloudflare 部署。
+
+**Q：Docker 方式的数据存在哪？**
+A：`docker/data/db.json`，挂载到宿主机，重启不丢。已在 `.gitignore` 排除，不入库。
+
+**Q：Docker 方式的 `scheduled` 如何触发？**
+A：`docker/server.js` 用 `setInterval` 每 6 小时调用一次 `worker.scheduled`，模拟 Cloudflare 的 cron。
+
 ---
 
 ## License
@@ -575,3 +655,5 @@ A：不需要。token-worker 的 `API_KEY` 只用于校验 TTS Worker 调用 `/g
 GNU Affero General Public License v3.0
 
 本项目采用 [AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.html) 许可。任何修改后的版本若通过网络提供服务，必须以相同许可开源。
+
+详见 [LICENSE](./LICENSE)。
