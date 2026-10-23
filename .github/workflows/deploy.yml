@@ -1,14 +1,12 @@
-name: Deploy to Cloudflare Workers
+name: Initial Deploy to Cloudflare Workers
 
 on:
-  push:
-    branches: [main]
-  workflow_dispatch:
+  workflow_dispatch:   # 仅手动触发，push 不触发
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    name: Deploy
+    name: Initial Deploy
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,7 +48,7 @@ jobs:
             echo "    WORKER_SHARED_SECRET"
             echo "  Variables:"
             echo "    WORKER_NODE_ID"
-            echo "    REMOTETOKEN (可选，多节点时填写)"
+            echo "    REMOTETOKEN (可选)"
             exit 1
           fi
           echo "✅ 配置检查通过"
@@ -88,16 +86,11 @@ jobs:
           NODE_ID: ${{ vars.WORKER_NODE_ID }}
           REMOTETOKEN: ${{ vars.REMOTETOKEN }}
         run: |
-          # 注入 database_id
           sed -i "s/REPLACE_WITH_YOUR_DATABASE_ID/$DB_ID/" wrangler.toml
-          # 注入 WORKER_NODE_ID（如与默认不同）
           if [ -n "$NODE_ID" ]; then
             sed -i "s|^WORKER_NODE_ID = .*|WORKER_NODE_ID = \"$NODE_ID\"|" wrangler.toml
           fi
-          # 注入 REMOTETOKEN（多行变量）
           if [ -n "$REMOTETOKEN" ]; then
-            echo "📝 注入 REMOTETOKEN"
-            # 用 node 处理多行替换，避免 sed 转义问题
             node -e "
               const fs = require('fs');
               let t = fs.readFileSync('wrangler.toml', 'utf8');
@@ -140,7 +133,7 @@ jobs:
         env:
           NODE_ID: ${{ vars.WORKER_NODE_ID }}
         run: |
-          echo "## ✅ 部署完成" >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ 首次部署完成" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| 项 | 值 |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
@@ -148,4 +141,9 @@ jobs:
           echo "| D1 | \`tts-db\` |" >> $GITHUB_STEP_SUMMARY
           echo "| 节点 ID | \`$NODE_ID\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "访问：https://tts-worker.<subdomain>.workers.dev" >> $GITHUB_STEP_SUMMARY
+          echo "### 下一步：配置 Cloudflare Dashboard 自动部署" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. 访问 Cloudflare Dashboard → Workers & Pages → tts-worker" >> $GITHUB_STEP_SUMMARY
+          echo "2. Settings → Builds & deployments → Connect Git" >> $GITHUB_STEP_SUMMARY
+          echo "3. 选择仓库，Build command 留空，Deploy command: \`npx wrangler deploy\`" >> $GITHUB_STEP_SUMMARY
+          echo "4. 后续 push 到 main 将由 Cloudflare 自动部署" >> $GITHUB_STEP_SUMMARY
