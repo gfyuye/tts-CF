@@ -1,0 +1,26 @@
+name = "tts-worker"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# ============ 明文变量 ============
+# WORKER_NODE_ID 和 REMOTETOKEN 在部署时由 CI 覆盖（方式一），
+# 或手动修改（方式二）
+[vars]
+WORKER_NODE_ID = "node-a"
+REMOTETOKEN = ""
+
+# ============ D1 数据库 ============
+# 方式一：CI 自动查询/创建并注入 database_id
+# 方式二：手动填入 Cloudflare Dashboard 创建的 database_id
+[[d1_databases]]
+binding = "DB"
+database_name = "tts-db"
+database_id = "REPLACE_WITH_YOUR_DATABASE_ID"
+
+# ============ 定时任务 ============
+[triggers]
+crons = ["0 */6 * * *"]  # 每 6 小时刷新端点表
+
+# ============ 可观测性 ============
+[observability]
+enabled = true
