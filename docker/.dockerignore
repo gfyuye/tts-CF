@@ -1,0 +1,6 @@
+../.git
+../.github
+../node_modules
+../.wrangler
+../*.md
+../docker/data/db.json
