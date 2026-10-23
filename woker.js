@@ -9,16 +9,45 @@ const TABLES = {
   VOICE_LIST: 'voice_list'
 };
 
-// 全局变量
+// ============ 全局变量 ============
 let endpointTable = {};
 let mergedVoiceListCache = null;
 let tokenCache = new Map();
 let isInitialized = false;
 let initializationPromise = null;
-let recentRequesters = new Map(); // 记录最近请求过我们的来源
-const BLOCK_DURATION = 60 * 3000; // 阻断3分钟
+let remoteServicesCache = null;
+let lastInitFailureAt = 0;
+const INIT_RETRY_COOLDOWN = 30 * 1000;
 
-// Token 优先级
+let recentRequesters = new Map();
+const BLOCK_DURATION = 3 * 60 * 1000;
+
+let remoteTokenConfig = '';
+let workerNodeId = '';
+let nodeSharedSecret = '';
+
+let endpointGenerating = null;
+
+const NODE_AUTH_MAX_SKEW_MS = 5 * 60 * 1000;
+const NODE_RATE_LIMIT = 30;
+const NODE_RATE_WINDOW_MS = 60 * 1000;
+const RECENT_REQUESTERS_MAX = 1000;
+const NODE_RATE_MAP_MAX = 1000;
+let nodeRateLimitMap = new Map();
+
+const MAX_TEXT_LENGTH = 4096;
+
+// 端点表并发生成每批数量 + 单区域超时
+const REGION_CONCURRENCY = 5;
+const REGION_TIMEOUT_MS = 10000;
+
+// outputFormat 白名单正则
+const OUTPUT_FORMAT_PATTERN = /^audio-\d+khz-\d+kbitrate-mono-(mp3|opus)$/;
+
+// rate/pitch 范围
+const RATE_MIN = -100, RATE_MAX = 100;
+const PITCH_MIN = -100, PITCH_MAX = 100;
+
 const TOKEN_PRIORITY = [
   { region: 'southeastasia', priority: 1 },
   { region: 'eastus', priority: 2 },
@@ -31,7 +60,6 @@ const TOKEN_PRIORITY = [
   { region: 'japaneast', priority: 9 }
 ];
 
-// SSML 标签
 const preserveTags = [
   { name: 'break', pattern: /<break\s+[^>]*\/>/g },
   { name: 'speak', pattern: /<speak>|<\/speak>/g },
@@ -47,10 +75,15 @@ const preserveTags = [
   { name: 'mstts', pattern: /<mstts:[^>]*>|<\/mstts:[^>]*>/g }
 ];
 
+const VOICE_STYLE_PATTERN = /^[A-Za-z0-9_.:-]+$/;
+
+// sign 的 HMAC key 缓存
+let _signKeyCache = null;
+
 // ============ 工具函数 ============
 
 function uuid() {
-  return crypto.randomUUID().replace(/-/g, '')
+  return crypto.randomUUID().replace(/-/g, '');
 }
 
 function sleep(ms) {
@@ -61,16 +94,19 @@ function escapeSSML(ssml) {
   let placeholders = new Map();
   let processedSSML = ssml;
   let counter = 0;
+  const salt = uuid();
+
   for (const tag of preserveTags) {
     processedSSML = processedSSML.replace(tag.pattern, function (match) {
-      const placeholder = `__SSML_PLACEHOLDER_${tag.name}_${counter++}__`;
+      const placeholder = `__SSML_${salt}_${tag.name}_${counter++}__`;
       placeholders.set(placeholder, match);
       return placeholder;
     });
   }
+
   let escapedContent = escapeBasicXml(processedSSML);
-  placeholders.forEach((tag, placeholder) => {
-    escapedContent = escapedContent.replace(placeholder, tag);
+  placeholders.forEach((value, key) => {
+    escapedContent = escapedContent.replace(key, () => value);
   });
   return escapedContent;
 }
@@ -83,24 +119,18 @@ function escapeBasicXml(unsafe) {
       case '&': return '&amp;';
       case '\'': return '&apos;';
       case '"': return '&quot;';
+      default: return c;
     }
   });
 }
 
-// 格式化剩余时间
 function formatRemainingTime(expiry) {
-  const remainingMs = expiry - Date.now();
+  const remainingMs = Math.max(0, expiry - Date.now());
   const minutes = Math.floor(remainingMs / 60000);
-  const seconds = Math.round((remainingMs % 60000) / 1000);
-  return { 
-    ms: remainingMs, 
-    minutes, 
-    seconds, 
-    text: `${minutes}分${seconds}秒` 
-  };
+  const seconds = Math.min(59, Math.floor((remainingMs % 60000) / 1000));
+  return { ms: remainingMs, minutes, seconds, text: `${minutes}分${seconds}秒` };
 }
 
-// 创建 JSON 响应
 function createJsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -108,44 +138,144 @@ function createJsonResponse(data, status = 200) {
   });
 }
 
-// 创建音频响应
+function createOpenAIError(message, status = 400, type = 'invalid_request_error', code = null) {
+  return createJsonResponse({ error: { message, type, code } }, status);
+}
+
 function createAudioResponse(response, download) {
   if (!download) return response;
+  if (!response.body) return response;
   const resp = new Response(response.body, response);
   resp.headers.set('Content-Disposition', `attachment; filename="${uuid()}.mp3"`);
   return resp;
 }
 
-// 从远程服务获取 token
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+
+// ============ 节点鉴权工具 ============
+
+function timingSafeEqualStr(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+async function computeNodeAuth(secret, nodeId, ts) {
+  const key = await crypto.subtle.importKey(
+    'raw', encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(`${nodeId}\n${ts}`));
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function getAllowedNodeIds() {
+  return new Set(getRemoteServices().map(s => s.marker));
+}
+
+function checkNodeRateLimit(nodeId) {
+  const now = Date.now();
+  const entry = nodeRateLimitMap.get(nodeId);
+  if (!entry || now - entry.windowStart >= NODE_RATE_WINDOW_MS) {
+    if (nodeRateLimitMap.size >= NODE_RATE_MAP_MAX && !nodeRateLimitMap.has(nodeId)) {
+      nodeRateLimitMap.delete(nodeRateLimitMap.keys().next().value);
+    }
+    nodeRateLimitMap.set(nodeId, { windowStart: now, count: 1 });
+    return true;
+  }
+  if (entry.count >= NODE_RATE_LIMIT) return false;
+  entry.count++;
+  return true;
+}
+
+function cleanupNodeRateLimit() {
+  const now = Date.now();
+  for (const [k, v] of nodeRateLimitMap) {
+    if (now - v.windowStart > 2 * NODE_RATE_WINDOW_MS) nodeRateLimitMap.delete(k);
+  }
+  if (nodeRateLimitMap.size > NODE_RATE_MAP_MAX) {
+    const excess = nodeRateLimitMap.size - NODE_RATE_MAP_MAX;
+    let removed = 0;
+    for (const k of nodeRateLimitMap.keys()) {
+      nodeRateLimitMap.delete(k);
+      if (++removed >= excess) break;
+    }
+  }
+}
+
+// ============ 远程服务列表 ============
+
+function getRemoteServices() {
+  if (remoteServicesCache) return remoteServicesCache;
+
+  const services = [];
+  if (!remoteTokenConfig) {
+    remoteServicesCache = services;
+    return services;
+  }
+
+  for (const line of remoteTokenConfig.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+
+    const parts = trimmed.split(/\s+/);
+    if (parts.length < 2) {
+      console.warn(`⚠️ REMOTETOKEN 行格式无效，已跳过: "${trimmed}"`);
+      continue;
+    }
+
+    const [name, url, apiKey = ''] = parts;
+    services.push({ url, apiKey, marker: name });
+  }
+
+  remoteServicesCache = services;
+  return services;
+}
+
+// ============ 远程获取 token ============
+
 async function getTokenFromRemoteService(service) {
   let timeout = null;
-  
+
   try {
     console.log(`尝试远程服务: ${service.marker}`);
-    
-    // 检查是否最近请求过我们
+
     const lastRequest = recentRequesters.get(service.marker);
     if (lastRequest && Date.now() - lastRequest < BLOCK_DURATION) {
       console.log(`⏭️ 跳过 ${service.marker}（最近请求过我们）`);
       return null;
     }
-    
+
+    if (!nodeSharedSecret) {
+      console.warn('❌ 本节点未配置 WORKER_SHARED_SECRET，跳过远程获取');
+      return null;
+    }
+
     const controller = new AbortController();
     timeout = setTimeout(() => controller.abort(), 10000);
-    
+
+    const ts = Date.now().toString();
+    const headers = {
+      'Content-Type': 'application/json',
+      'X-Node-Id': workerNodeId,
+      'X-TS': ts,
+      'X-Auth': await computeNodeAuth(nodeSharedSecret, workerNodeId, ts)
+    };
+    if (service.apiKey) headers['X-API-Key'] = service.apiKey;
+
     const response = await fetch(service.url, {
       method: 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': service.apiKey,
-        'X-Token-Requester': 'tts'
-      },
+      headers,
       signal: controller.signal
     });
-    
+
     clearTimeout(timeout);
     timeout = null;
-    
+
     if (!response.ok) {
       try {
         const errorData = await response.json();
@@ -155,13 +285,12 @@ async function getTokenFromRemoteService(service) {
       }
       return null;
     }
-    
+
     const data = await response.json();
-    
+
     if (data.success && data.token) {
       const timeInfo = formatRemainingTime(data.expiry);
       console.log(`📡 从 ${service.marker} 获取token成功: ${data.region}(优先级${data.priority}, ${timeInfo.text})`);
-      
       return {
         region: data.region,
         token: data.token,
@@ -169,16 +298,14 @@ async function getTokenFromRemoteService(service) {
         priority: data.priority
       };
     }
-    
+
     console.warn(`远程服务返回失败: ${data.error || 'unknown'}`);
     return null;
-    
   } catch (error) {
     if (timeout) {
       clearTimeout(timeout);
       timeout = null;
     }
-    
     if (error.name === 'AbortError') {
       console.warn(`远程服务超时: ${service.marker}`);
     } else {
@@ -188,32 +315,14 @@ async function getTokenFromRemoteService(service) {
   }
 }
 
-// 获取远程服务列表
-function getRemoteServices() {
-  return [
-    {
-      url: 'https://url1',
-      apiKey: 'apiKey1',
-      marker: 'url1'
-    },
-    {
-      url: 'http://url2',
-      apiKey: 'apiKey2',
-      marker: 'url2'
-    }
-  ];
-}
-
-
 // ============ D1 操作 ============
 
-// 安全的 D1 查询包装器
 async function safeD1Query(DB, table, processFn, errorMessage) {
   try {
+    if (!DB) throw new Error('DB 未绑定');
+    if (!Object.values(TABLES).includes(table)) throw new Error(`非法表名: ${table}`);
     const result = await DB.prepare(`SELECT * FROM ${table}`).all();
-    if (result.results && result.results.length > 0) {
-      return processFn(result.results);
-    }
+    if (result.results && result.results.length > 0) return processFn(result.results);
     return null;
   } catch (error) {
     console.warn(`${errorMessage}:`, error.message);
@@ -222,34 +331,33 @@ async function safeD1Query(DB, table, processFn, errorMessage) {
 }
 
 async function loadEndpointTableFromD1(DB) {
-  return await safeD1Query(
-    DB, 
-    TABLES.ENDPOINT_TABLE,
-    (rows) => {
-      const table = {};
-      for (const row of rows) {
-        table[row.region] = {
-          priority: row.priority,
-          voices: JSON.parse(row.voices_data)
-        };
-      }
-      return table;
-    },
-    '从 D1 加载端点表失败'
-  );
+  return await safeD1Query(DB, TABLES.ENDPOINT_TABLE, (rows) => {
+    const table = {};
+    for (const row of rows) {
+      table[row.region] = { priority: row.priority, voices: JSON.parse(row.voices_data) };
+    }
+    return table;
+  }, '从 D1 加载端点表失败');
 }
 
 async function saveEndpointTableToD1(DB) {
   try {
+    if (!DB) return;
     const now = Date.now();
-    await DB.prepare(`DELETE FROM ${TABLES.ENDPOINT_TABLE}`).run();
-    
-    for (const [region, data] of Object.entries(endpointTable)) {
-      await DB.prepare(
-        `INSERT OR REPLACE INTO ${TABLES.ENDPOINT_TABLE} (region, priority, voices_data, updated_at) VALUES (?, ?, ?, ?)`
-      ).bind(region, data.priority, JSON.stringify(data.voices), now).run();
+    const entries = Object.entries(endpointTable);
+    if (entries.length === 0) {
+      console.warn('⚠️ 端点表为空，跳过保存');
+      return;
     }
-    console.log(`💾 端点表已保存到D1 (${Object.keys(endpointTable).length}个区域)`);
+    await DB.batch([
+      DB.prepare(`DELETE FROM ${TABLES.ENDPOINT_TABLE}`),
+      ...entries.map(([region, data]) =>
+        DB.prepare(
+          `INSERT OR REPLACE INTO ${TABLES.ENDPOINT_TABLE} (region, priority, voices_data, updated_at) VALUES (?, ?, ?, ?)`
+        ).bind(region, data.priority, JSON.stringify(data.voices), now)
+      )
+    ]);
+    console.log(`💾 端点表已保存到D1 (${entries.length}个区域)`);
   } catch (error) {
     console.warn('保存端点表到D1失败:', error.message);
   }
@@ -257,6 +365,7 @@ async function saveEndpointTableToD1(DB) {
 
 async function loadTokenCacheFromD1(DB) {
   try {
+    if (!DB) return new Map();
     const now = Date.now();
     const result = await DB.prepare(`SELECT * FROM ${TABLES.TOKEN_CACHE} WHERE expiry > ?`).bind(now).all();
     const cache = new Map();
@@ -276,29 +385,26 @@ async function loadTokenCacheFromD1(DB) {
   }
 }
 
-// 保存单个 token 到 D1
-async function saveTokenToD1(DB, region, data, now) {
-  return await DB.prepare(
-    `INSERT OR REPLACE INTO ${TABLES.TOKEN_CACHE} (region, token, expiry, priority, updated_at) VALUES (?, ?, ?, ?, ?)`
-  ).bind(region, data.token, data.expiry, data.priority, now).run();
-}
-
 async function saveTokenCacheToD1(DB) {
   try {
+    if (!DB) return;
     const now = Date.now();
-    await DB.prepare(`DELETE FROM ${TABLES.TOKEN_CACHE} WHERE expiry < ?`).bind(now).run();
-    
-    let savedCount = 0;
-    
-    for (const [region, data] of tokenCache) {
-      if (data.expiry > now) {
-        await saveTokenToD1(DB, region, data, now);
-        savedCount++;
-      }
+    const validEntries = [...tokenCache].filter(([, data]) => data.expiry > now);
+
+    const statements = [
+      DB.prepare(`DELETE FROM ${TABLES.TOKEN_CACHE} WHERE expiry < ?`).bind(now)
+    ];
+    for (const [region, data] of validEntries) {
+      statements.push(
+        DB.prepare(
+          `INSERT OR REPLACE INTO ${TABLES.TOKEN_CACHE} (region, token, expiry, priority, updated_at) VALUES (?, ?, ?, ?, ?)`
+        ).bind(region, data.token, data.expiry, data.priority, now)
+      );
     }
-    
-    if (savedCount > 0) {
-      console.log(`💾 保存${savedCount}个token到D1`);
+
+    await DB.batch(statements);
+    if (validEntries.length > 0) {
+      console.log(`💾 保存${validEntries.length}个token到D1`);
     }
   } catch (error) {
     console.warn('保存token缓存到D1失败:', error.message);
@@ -316,14 +422,21 @@ async function loadVoiceListFromD1(DB) {
 
 async function saveVoiceListToD1(DB) {
   try {
+    if (!DB) return;
     const now = Date.now();
-    await DB.prepare(`DELETE FROM ${TABLES.VOICE_LIST}`).run();
-    
-    for (const voice of mergedVoiceListCache) {
-      await DB.prepare(
-        `INSERT OR REPLACE INTO ${TABLES.VOICE_LIST} (voice_name, voice_data, updated_at) VALUES (?, ?, ?)`
-      ).bind(voice.ShortName, JSON.stringify(voice), now).run();
+    if (!mergedVoiceListCache || mergedVoiceListCache.length === 0) {
+      console.warn('⚠️ 语音列表为空，跳过保存');
+      return;
     }
+    await DB.batch([
+      DB.prepare(`DELETE FROM ${TABLES.VOICE_LIST}`),
+      ...mergedVoiceListCache.map(voice =>
+        DB.prepare(
+          `INSERT OR REPLACE INTO ${TABLES.VOICE_LIST} (voice_name, voice_data, updated_at) VALUES (?, ?, ?)`
+        ).bind(voice.ShortName, JSON.stringify(voice), now)
+      )
+    ]);
+    console.log(`💾 语音列表已保存到D1 (${mergedVoiceListCache.length}个语音)`);
   } catch (error) {
     console.warn('保存语音列表到D1失败:', error.message);
   }
@@ -343,8 +456,7 @@ function decodeJwtPayload(token) {
     const payload = parts[1];
     const padded = payload.replace(/-/g, '+').replace(/_/g, '/');
     const padding = '='.repeat((4 - padded.length % 4) % 4);
-    const decoded = atob(padded + padding);
-    return JSON.parse(decoded);
+    return JSON.parse(atob(padded + padding));
   } catch (error) {
     return null;
   }
@@ -365,15 +477,15 @@ async function getDynamicToken() {
       'Content-Length': '0',
       'Accept-Encoding': 'gzip'
     };
-    const response = await fetch(endpointUrl, { method: '', headers: headers });
-    
+    const response = await fetch(endpointUrl, { method: 'POST', headers: headers });
+
     if (response.ok) {
       const data = await response.json();
       const jwtPayload = decodeJwtPayload(data.t);
-      
+
       let actualRegion = data.r || 'unknown';
       let tokenExpiry = Date.now() + 20 * 60 * 1000;
-      
+
       if (jwtPayload) {
         if (jwtPayload.exp) tokenExpiry = jwtPayload.exp * 1000;
         if (jwtPayload.aud) {
@@ -381,12 +493,12 @@ async function getDynamicToken() {
           if (audMatch) actualRegion = audMatch[1];
         }
       }
-      
+
       const priority = getPriority(actualRegion);
-      
-      return { 
-        region: actualRegion, 
-        token: data.t, 
+
+      return {
+        region: actualRegion,
+        token: data.t,
         expiry: tokenExpiry,
         priority: priority
       };
@@ -398,85 +510,85 @@ async function getDynamicToken() {
   }
 }
 
-// 刷新 token（分阶段获取）
 async function refreshToken(DB, voiceName, style) {
   console.log('🔄 开始刷新token');
-  // 备用 token 缓存（按优先级编号）
-    const backupTokens = new Map(); // priority -> token    
-    // ============ 第一轮：3次尝试 ============
-    for (let i = 0; i < 3; i++) {
-      const tokenData = await getDynamicToken();
-      
-      if (!tokenData) {
-        await sleep(200);
-        continue;
-      }
-      
-      const priority = tokenData.priority;
-      const region = tokenData.region;      
-      const timeInfo = formatRemainingTime(tokenData.expiry);
-      //匹配获取的token能否匹配需要的语言与风格
-      const isMatch = checkVoiceStyle(region, voiceName, style);
-      if (!isMatch) {
-        console.log(`❌ 获取token: ${region}(优先级${priority}, 声音或风格与需求不匹配，弃用。)`);
-        await sleep(200);
-        continue;
-      }
-      else {
-        console.log(`✅ token: ${region}(优先级${priority}, 有效期${timeInfo.text})，语言及风格匹配成功。`);
-        return tokenData;
-      }       
-    }              
-    // ============ 失败3次后远程获取（前5级） ============   
-    console.log('❌ 无匹配语言及风格的token，从远程获取'); 
-// 获取所有远程服务
-const remoteServices = getRemoteServices();
 
-for (let index = 0; index < remoteServices.length; index++) {
-  const service = remoteServices[index];
-  
-  console.log(`尝试第 ${index + 1}/${remoteServices.length} 个远程服务`);
-  
-  const remoteToken = await getTokenFromRemoteService(service);
-  
-  if (!remoteToken) {
-    console.log(`❌ 第${index + 1}个远程服务获取失败`);
-    continue;
+  for (let i = 0; i < 3; i++) {
+    const tokenData = await getDynamicToken();
+
+    if (!tokenData) {
+      await sleep(200);
+      continue;
+    }
+
+    const priority = tokenData.priority;
+    const region = tokenData.region;
+    const timeInfo = formatRemainingTime(tokenData.expiry);
+
+    const isMatch = checkVoiceStyle(region, voiceName, style);
+    if (!isMatch) {
+      console.log(`❌ 获取token: ${region}(优先级${priority}, 声音或风格与需求不匹配，弃用。)`);
+      await sleep(200);
+      continue;
+    }
+
+    console.log(`✅ token: ${region}(优先级${priority}, 有效期${timeInfo.text})，语言及风格匹配成功。`);
+    return tokenData;
   }
-  
-  // ============ 检查语音/风格是否匹配 ============
-  const isMatch = checkVoiceStyle(remoteToken.region, voiceName, style);
-  
-  if (isMatch) {
-    const remoteTimeInfo = formatRemainingTime(remoteToken.expiry);
-    console.log(`✅ 远程获取匹配token成功: ${remoteToken.region}(优先级${remoteToken.priority}, ${remoteTimeInfo.text})`);
-    
+
+  console.log('❌ 无匹配语言及风格的token，从远程获取');
+
+  const remoteServices = getRemoteServices();
+  let cacheDirty = false;
+
+  for (let index = 0; index < remoteServices.length; index++) {
+    const service = remoteServices[index];
+    console.log(`尝试第 ${index + 1}/${remoteServices.length} 个远程服务`);
+
+    const remoteToken = await getTokenFromRemoteService(service);
+
+    if (!remoteToken) {
+      console.log(`❌ 第${index + 1}个远程服务获取失败`);
+      continue;
+    }
+
+    const isMatch = checkVoiceStyle(remoteToken.region, voiceName, style);
+
+    if (isMatch) {
+      const remoteTimeInfo = formatRemainingTime(remoteToken.expiry);
+      console.log(`✅ 远程获取匹配token成功: ${remoteToken.region}(优先级${remoteToken.priority}, ${remoteTimeInfo.text})`);
+      tokenCache.set(remoteToken.region, remoteToken);
+      await saveTokenCacheToD1(DB);
+      return remoteToken;
+    }
+
+    console.log(`❌ 远程token: ${remoteToken.region}(优先级${remoteToken.priority}, 不匹配，缓存备用)`);
     tokenCache.set(remoteToken.region, remoteToken);
-    await saveTokenCacheToD1(DB);
-    return remoteToken;
+    cacheDirty = true;
   }
-  
-  // 不匹配，缓存备用
-  console.log(`❌ 远程token: ${remoteToken.region}(优先级${remoteToken.priority}, 不匹配，缓存备用)`);
-  tokenCache.set(remoteToken.region, remoteToken);
-  await saveTokenCacheToD1(DB);
-  
-  // 继续下一个远程服务
+
+  if (cacheDirty) {
+    await saveTokenCacheToD1(DB);
+  }
+
+  console.log('❌ 所有远程服务均无匹配token');
+  return null;
 }
 
-console.log('❌ 所有远程服务均无匹配token');
-  console.log('❌ 未能获取匹配成功的token');  
-  return null;   
-}
-
-// 获取最佳 token
 let refreshPromise = null;
+
+function ensureRefresh(DB, voiceName, style) {
+  if (!refreshPromise) {
+    refreshPromise = refreshToken(DB, voiceName, style)
+      .finally(() => { refreshPromise = null; });
+  }
+  return refreshPromise;
+}
 
 async function getBestToken(DB, voiceName, style) {
   const now = Date.now();
   const TOKEN_REFRESH_THRESHOLD = 5 * 60 * 1000;
 
-  // 清理过期 token
   let expiredCount = 0;
   for (const [region, data] of tokenCache) {
     if (!data.expiry || data.expiry < now) {
@@ -484,109 +596,98 @@ async function getBestToken(DB, voiceName, style) {
       expiredCount++;
     }
   }
-  
   if (expiredCount > 0) {
     console.log(`🧹 清理${expiredCount}个过期token`);
   }
-  
-  // 检查缓存中是否有可用的 token
-  let bestMatch = null; 
-  
-  for (const [region, data] of tokenCache) {   
-    // 匹配请求的语音和风格
-    if (checkVoiceStyle(region, voiceName, style)) {    
-      // 找到优先级最高的匹配 token
+
+  let bestMatch = null;
+  for (const [region, data] of tokenCache) {
+    if (checkVoiceStyle(region, voiceName, style)) {
       if (!bestMatch || data.priority < bestMatch.priority) {
         bestMatch = { region, ...data };
-      }  
+      }
     }
-  } 
-  
+  }
+
   if (bestMatch) {
     const timeInfo = formatRemainingTime(bestMatch.expiry);
-    
-    // 首先判断token是否即将过期，如果是则先使用，后台刷新    
+
     if (bestMatch.expiry < now + TOKEN_REFRESH_THRESHOLD) {
       console.log(`⚠️ Token即将过期(${timeInfo.text})，后台刷新`);
-      
-      if (!refreshPromise) {
-        refreshPromise = refreshToken(DB, voiceName, style)
-          .then(newToken => {
-            if (newToken) {
-              const newTimeInfo = formatRemainingTime(newToken.expiry);
-              console.log(`✅ 后台刷新成功: ${newToken.region}(优先级${newToken.priority}, ${newTimeInfo.text})`);
-            }
-            return newToken;
-          })
-          .finally(() => { refreshPromise = null; });
-      }
+      ensureRefresh(DB, voiceName, style)
+        .then(newToken => {
+          if (newToken) {
+            const newTimeInfo = formatRemainingTime(newToken.expiry);
+            console.log(`✅ 后台刷新成功: ${newToken.region}(优先级${newToken.priority}, ${newTimeInfo.text})`);
+          }
+        })
+        .catch(e => console.warn('后台刷新失败:', e.message));
     } else {
       console.log(`✅ 使用缓存token: 区域=${bestMatch.region}, 优先级=${bestMatch.priority}, 有效期=${timeInfo.text}`);
     }
-    
+
     return bestMatch;
   }
-  
-  // 缓存无可用 token
+
   console.log('📭 无可用token，获取新token');
-  // 如果已有刷新在进行，等待同一个 Promise
   if (refreshPromise) {
     console.log('⏳ 刷新已在进行中，等待完成...');
-    const newToken = await refreshPromise;    
-    // 刷新完成后，重新检查缓存
-    if (newToken && newToken.expiry > Date.now()) {
+    const newToken = await refreshPromise;
+    if (newToken && newToken.expiry > Date.now() && checkVoiceStyle(newToken.region, voiceName, style)) {
       return newToken;
-    }    
-    // 刷新失败，继续走正常流程
-  }  
-  // 创建新的刷新 Promise
-  refreshPromise = refreshToken(DB, voiceName, style)
-    .finally(() => { refreshPromise = null; });  
-  return await refreshPromise;
+    }
+    console.warn('⚠️ 等待的刷新结果不匹配当前 voice/style，返回 null');
+    return null;
+  }
+
+  return await ensureRefresh(DB, voiceName, style);
 }
 
-// ============ 端点表生成 ============
+// ============ 端点表生成（单飞锁 + 分批并发） ============
 
 async function generateEndpointTable(DB) {
-  console.log('🔄 开始生成端点表');
-  
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.26',
-    'X-Ms-Useragent': 'SpeechStudio/2021.05.001',
-    'Content-Type': 'application/json',
-    'Origin': 'https://azure.microsoft.com',
-    'Referer': 'https://azure.microsoft.com'
-  };
-  
-  const newEndpointTable = {};
-  
-  for (const priorityItem of TOKEN_PRIORITY) {
-    const region = priorityItem.region;
-    const url = `https://${region}.api.speech.microsoft.com/cognitiveservices/voices/list`;
-    
-    let timeout = null; // 在 try 块外声明
-    
-    try {
-      console.log(`获取 ${region} 的语音列表...`);
-      
-      const controller = new AbortController();
-      timeout = setTimeout(() => controller.abort(), 20000);
-      const response = await fetch(url, { method: 'GET', headers, signal: controller.signal });
-      clearTimeout(timeout);
-      
-      if (!response.ok) {
-        console.warn(`${region}: HTTP ${response.status}`);
-        continue;
-      }
-      
-      const allVoices = await response.json();
-      if (!Array.isArray(allVoices)) continue;
-      
-      const chineseVoices = allVoices.filter(v => 
-        v && v.Locale && v.Locale.startsWith('zh-') && v.ShortName
-      );
-      
-      if (chineseVoices.length > 0) {
+  if (endpointGenerating) {
+    console.log('⏳ 端点表生成进行中，等待完成...');
+    return await endpointGenerating;
+  }
+
+  endpointGenerating = (async () => {
+    console.log('🔄 开始生成端点表');
+
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.26',
+      'X-Ms-Useragent': 'SpeechStudio/2021.05.001',
+      'Content-Type': 'application/json',
+      'Origin': 'https://azure.microsoft.com',
+      'Referer': 'https://azure.microsoft.com'
+    };
+
+    const fetchRegion = async (priorityItem) => {
+      const region = priorityItem.region;
+      const url = `https://${region}.api.speech.microsoft.com/cognitiveservices/voices/list`;
+      let timeout = null;
+
+      try {
+        console.log(`获取 ${region} 的语音列表...`);
+        const controller = new AbortController();
+        timeout = setTimeout(() => controller.abort(), REGION_TIMEOUT_MS);
+        const response = await fetch(url, { method: 'GET', headers, signal: controller.signal });
+        clearTimeout(timeout);
+        timeout = null;
+
+        if (!response.ok) {
+          console.warn(`${region}: HTTP ${response.status}`);
+          return null;
+        }
+
+        const allVoices = await response.json();
+        if (!Array.isArray(allVoices)) return null;
+
+        const chineseVoices = allVoices.filter(v =>
+          v && v.Locale && v.Locale.startsWith('zh-') && v.ShortName
+        );
+        if (chineseVoices.length === 0) return null;
+
         const voicesMap = {};
         for (const voice of chineseVoices) {
           voicesMap[voice.ShortName] = {
@@ -596,36 +697,50 @@ async function generateEndpointTable(DB) {
             StyleList: voice.StyleList || ['general']
           };
         }
-        newEndpointTable[region] = { 
-          priority: priorityItem.priority, 
-          voices: voicesMap 
-        };
         console.log(`  ${region}: ${chineseVoices.length}个语音`);
+        return {
+          region,
+          data: { priority: priorityItem.priority, voices: voicesMap }
+        };
+      } catch (error) {
+        if (timeout) clearTimeout(timeout);
+        if (error.name === 'AbortError') {
+          console.warn(`  ${region}: 超时`);
+        } else {
+          console.warn(`  ${region}: ${error.message}`);
+        }
+        return null;
       }
-    } catch (error) {
-      if (timeout) {
-        clearTimeout(timeout);
+    };
+
+    const newEndpointTable = {};
+    for (let i = 0; i < TOKEN_PRIORITY.length; i += REGION_CONCURRENCY) {
+      const batch = TOKEN_PRIORITY.slice(i, i + REGION_CONCURRENCY);
+      const results = await Promise.all(batch.map(fetchRegion));
+      for (const r of results) {
+        if (r) newEndpointTable[r.region] = r.data;
       }
-      console.warn(`  ${region}: ${error.message}`);
     }
-    
-    await sleep(300);
-  }
-  
-  if (Object.keys(newEndpointTable).length > 0) {
-    endpointTable = newEndpointTable;
-    await generateMergedVoiceList();
-    await saveEndpointTableToD1(DB);
-    await saveVoiceListToD1(DB);
-    console.log(`✅ 端点表生成完成 (${Object.keys(endpointTable).length}个区域)`);
-  }
-  
-  return endpointTable;
+
+    if (Object.keys(newEndpointTable).length > 0) {
+      endpointTable = newEndpointTable;
+      await generateMergedVoiceList();
+      await saveEndpointTableToD1(DB);
+      await saveVoiceListToD1(DB);
+      console.log(`✅ 端点表生成完成 (${Object.keys(endpointTable).length}个区域)`);
+    } else {
+      console.warn('⚠️ 本次生成未获得任何区域数据，保留原端点表');
+    }
+
+    return endpointTable;
+  })().finally(() => { endpointGenerating = null; });
+
+  return await endpointGenerating;
 }
 
 async function generateMergedVoiceList() {
   const mergedVoices = new Map();
-  
+
   for (const [region, data] of Object.entries(endpointTable)) {
     for (const [voiceName, voiceData] of Object.entries(data.voices)) {
       if (!mergedVoices.has(voiceName)) {
@@ -642,7 +757,7 @@ async function generateMergedVoiceList() {
       }
     }
   }
-  
+
   const result = [];
   for (const [voiceName, data] of mergedVoices) {
     result.push({
@@ -653,45 +768,74 @@ async function generateMergedVoiceList() {
       StyleList: [...data.StyleList]
     });
   }
-  
+
   mergedVoiceListCache = result;
   return result;
 }
 
 async function getMergedVoiceList(DB) {
   if (mergedVoiceListCache && mergedVoiceListCache.length > 0) return mergedVoiceListCache;
-  
+
   const cached = await loadVoiceListFromD1(DB);
   if (cached && cached.length > 0) {
     mergedVoiceListCache = cached;
     return cached;
   }
-  
+
   return await generateMergedVoiceList();
 }
 
-// 检查语音和风格是否在端点表中
 function checkVoiceStyle(region, voiceName, style) {
   const endpointData = endpointTable[region];
   if (!endpointData) return false;
-  
+
   const voiceData = endpointData.voices[voiceName];
   if (!voiceData) return false;
-  
+
   return voiceData.StyleList.includes(style);
 }
 
 // ============ TTS 请求 ============
 
 async function getVoice(DB, text, voiceName, rate, pitch, style, outputFormat, download) {
+  const mergedVoices = await getMergedVoiceList(DB);
+
+  if (!mergedVoices || mergedVoices.length === 0) {
+    console.warn('❌ 语音列表为空，服务未就绪');
+    return createJsonResponse({ error: 'Service not ready: no voices loaded' }, 503);
+  }
+
+  if (!VOICE_STYLE_PATTERN.test(voiceName)) {
+    console.warn(`❌ 非法 voiceName 格式: ${voiceName}`);
+    return createOpenAIError(`Invalid voice format: ${voiceName}`, 400, 'invalid_request_error', 'invalid_voice_format');
+  }
+  if (!VOICE_STYLE_PATTERN.test(style)) {
+    console.warn(`❌ 非法 style 格式: ${style}`);
+    return createOpenAIError(`Invalid style format: ${style}`, 400, 'invalid_request_error', 'invalid_style_format');
+  }
+
+  const voice = mergedVoices.find(v => v.ShortName === voiceName);
+  if (!voice) {
+    console.warn(`❌ 未知语音: ${voiceName}`);
+    return createOpenAIError(`Unknown voice: ${voiceName}`, 400, 'invalid_request_error', 'unknown_voice');
+  }
+  if (!voice.StyleList.includes(style)) {
+    console.warn(`❌ 未知风格: ${style} (voice=${voiceName})`);
+    return createOpenAIError(`Unknown style for voice ${voiceName}: ${style}`, 400, 'invalid_request_error', 'unknown_style');
+  }
+
+  if (!OUTPUT_FORMAT_PATTERN.test(outputFormat)) {
+    console.warn(`❌ 非法 outputFormat: ${outputFormat}`);
+    return createOpenAIError(`Invalid outputFormat: ${outputFormat}`, 400, 'invalid_request_error', 'invalid_output_format');
+  }
+
   const bestToken = await getBestToken(DB, voiceName, style);
-  
+
   if (!bestToken) {
     return createJsonResponse({ error: '无法获取 TTS token' }, 500);
   }
-  
+
   const timeInfo = formatRemainingTime(bestToken.expiry);
-  
   const url = `https://${bestToken.region}.tts.speech.microsoft.com/cognitiveservices/v1`;
   const headers = {
     'Authorization': bestToken.token,
@@ -699,39 +843,70 @@ async function getVoice(DB, text, voiceName, rate, pitch, style, outputFormat, d
     'User-Agent': 'okhttp/4.5.0',
     'X-Microsoft-OutputFormat': outputFormat
   };
-  const ssml = getSsml(text, voiceName, rate, pitch, style);
-  
+
+  // ⚠️-1：getSsml 抛错捕获，转 400
+  let ssml;
+  try {
+    ssml = getSsml(text, voiceName, rate, pitch, style);
+  } catch (e) {
+    console.error('❌ 生成 SSML 失败:', e.message);
+    return createOpenAIError(`Invalid SSML parameters: ${e.message}`, 400, 'invalid_request_error', 'invalid_ssml_params');
+  }
+
   console.log(`🎵 TTS请求: ${bestToken.region}(优先级${bestToken.priority}，有效期${timeInfo.text}), ${voiceName}, ${style}`);
-  
-  const response = await fetch(url, { method: '', headers, body: ssml });
-  
+
+  const response = await fetch(url, { method: 'POST', headers, body: ssml });
+
   if (response.ok) {
     return createAudioResponse(response, download);
-  } else {
-    if (response.status === 401 || response.status === 403) {
-      tokenCache.delete(bestToken.region);
-      await saveTokenCacheToD1(DB);
-      
-      const newToken = await refreshToken(DB, voiceName, style);
-      if (newToken) {
-        const newTimeInfo = formatRemainingTime(newToken.expiry);
-        console.log(`🔄 使用新token重试: ${newToken.region}(优先级${newToken.priority}, ${newTimeInfo.text})`);
-        
-        const newUrl = `https://${newToken.region}.tts.speech.microsoft.com/cognitiveservices/v1`;
-        const newHeaders = { ...headers, 'Authorization': newToken.token };
-        const newResponse = await fetch(newUrl, { method: '', headers: newHeaders, body: ssml });
-        if (newResponse.ok) {
-          return createAudioResponse(newResponse, download);
-        }
-      }
-    }
-    
-    const errorText = await response.text();
-    return new Response(errorText || response.statusText, { status: response.status });
   }
+
+  if (response.status === 401 || response.status === 403) {
+    const firstStatus = response.status;
+
+    let firstError = await response.text();
+    try {
+      const j = JSON.parse(firstError);
+      if (j.error?.message) firstError = j.error.message;
+    } catch {}
+
+    console.warn(`⚠️ TTS 首次失败: HTTP ${firstStatus}, 尝试刷新token重试${firstError ? `, 错误: ${firstError}` : ''}`);
+
+    tokenCache.delete(bestToken.region);
+    await saveTokenCacheToD1(DB);
+
+    const newToken = await ensureRefresh(DB, voiceName, style);
+    if (newToken) {
+      const newTimeInfo = formatRemainingTime(newToken.expiry);
+      console.log(`🔄 使用新token重试: ${newToken.region}(优先级${newToken.priority}, ${newTimeInfo.text})`);
+
+      const newUrl = `https://${newToken.region}.tts.speech.microsoft.com/cognitiveservices/v1`;
+      const newHeaders = { ...headers, 'Authorization': newToken.token };
+      const newResponse = await fetch(newUrl, { method: 'POST', headers: newHeaders, body: ssml });
+      if (newResponse.ok) {
+        return createAudioResponse(newResponse, download);
+      }
+
+      const retryStatus = newResponse.status;
+      let retryError = await newResponse.text();
+      try {
+        const j = JSON.parse(retryError);
+        if (j.error?.message) retryError = j.error.message;
+      } catch {}
+
+      console.error(`❌ TTS 重试仍失败: HTTP ${retryStatus} (首次 ${firstStatus})${retryError ? `, 错误: ${retryError}` : ''}`);
+      return new Response(retryError || newResponse.statusText, { status: retryStatus });
+    }
+
+    console.error(`❌ TTS 首次失败 HTTP ${firstStatus}，且 token 刷新失败${firstError ? `, 首次错误: ${firstError}` : ''}`);
+    return new Response(firstError || 'TTS failed and token refresh failed', { status: firstStatus });
+  }
+
+  const errorText = await response.text();
+  return new Response(errorText || response.statusText, { status: response.status });
 }
 
-// ============ 其他工具函数 ============
+// ============ 其他工具 ============
 
 function generateUserId() {
   const chars = 'abcdef0123456789';
@@ -746,8 +921,12 @@ async function sign(urlStr) {
   const uuidStr = uuid();
   const formattedDate = dateFormat();
   const bytesToSign = `MSTranslatorAndroidApp${encodedUrl}${formattedDate}${uuidStr}`.toLowerCase();
-  const decode = await base64ToBytes('oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw==');
-  const signData = await hmacSha256(decode, bytesToSign);
+
+  // ⚠️-8：decode 缓存
+  if (!_signKeyCache) {
+    _signKeyCache = await base64ToBytes('oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw==');
+  }
+  const signData = await hmacSha256(_signKeyCache, bytesToSign);
   const signBase64 = await bytesToBase64(signData);
   return `MSTranslatorAndroidApp::${signBase64}::${formattedDate}::${uuidStr}`;
 }
@@ -758,8 +937,8 @@ function dateFormat() {
 
 async function hmacSha256(key, data) {
   const cryptoKey = await crypto.subtle.importKey(
-    'raw', key, 
-    { name: 'HMAC', hash: { name: 'SHA-256' } }, 
+    'raw', key,
+    { name: 'HMAC', hash: 'SHA-256' },
     false, ['sign']
   );
   const signature = await crypto.subtle.sign('HMAC', cryptoKey, encoder.encode(data));
@@ -778,41 +957,60 @@ async function bytesToBase64(bytes) {
 }
 
 function validateApiKey(apiKey, env) {
-  const expectedApiKey = env.API_KEY || '';
-  return apiKey === expectedApiKey;
+  const expected = env.API_KEY || '';
+  if (!expected) return false;
+  if (typeof apiKey !== 'string') return false;
+  return timingSafeEqualStr(apiKey, expected);
 }
 
 function getSsml(text, voiceName, rate, pitch, style = 'general') {
+  if (!VOICE_STYLE_PATTERN.test(voiceName)) {
+    throw new Error(`Invalid voiceName format: ${voiceName}`);
+  }
+  if (!VOICE_STYLE_PATTERN.test(style)) {
+    throw new Error(`Invalid style format: ${style}`);
+  }
   text = escapeSSML(text);
   return `<speak xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" version="1.0" xml:lang="zh-CN"> <voice name="${voiceName}"> <mstts:express-as style="${style}" styledegree="1.0" role="default"> <prosody rate="${rate}%" pitch="${pitch}%" volume="50">${text}</prosody> </mstts:express-as> </voice> </speak>`;
 }
 
-// ============ 初始化（使用初始化 Promise） ============
+// ============ 初始化 ============
 
 async function initialize(env) {
-  // 如果已初始化，直接返回
   if (isInitialized) return;
-  
-  // 如果正在初始化，等待同一个 Promise
   if (initializationPromise) {
     console.log('⏳ 初始化进行中，等待完成...');
     return initializationPromise;
   }
-  
+  if (Date.now() - lastInitFailureAt < INIT_RETRY_COOLDOWN) {
+    const err = new Error('Initialization recently failed, cooldown');
+    err.code = 'INIT_COOLDOWN';
+    throw err;
+  }
+  if (!env.DB) {
+    throw new Error('env.DB not bound');
+  }
+
   console.log('🚀 冷启动，开始初始化...');
   const startTime = Date.now();
-  
-  // 创建初始化 Promise
+
   initializationPromise = (async () => {
     try {
-      // 并行加载数据以提高速度
+      remoteTokenConfig = env.REMOTETOKEN || '';
+      remoteServicesCache = null;
+      workerNodeId = env.WORKER_NODE_ID || '';
+      nodeSharedSecret = env.WORKER_SHARED_SECRET || '';
+
+      if (!workerNodeId) console.warn('⚠️ WORKER_NODE_ID 未配置，/get-token 将拒绝所有请求');
+      if (!nodeSharedSecret) console.warn('⚠️ WORKER_SHARED_SECRET 未配置，/get-token 将返回 500');
+      if (!env.API_KEY) console.warn('⚠️ API_KEY 未配置，所有 /tts 请求将 401');
+
       const [d1EndpointTable, d1Tokens, d1Voices] = await Promise.all([
         loadEndpointTableFromD1(env.DB),
         loadTokenCacheFromD1(env.DB),
         loadVoiceListFromD1(env.DB)
       ]);
-      
-      // 处理端点表
+
       if (d1EndpointTable && Object.keys(d1EndpointTable).length > 0) {
         endpointTable = d1EndpointTable;
         console.log(`📊 从D1加载端点表: ${Object.keys(endpointTable).length}个端点`);
@@ -820,27 +1018,28 @@ async function initialize(env) {
         console.log('📊 D1无端点表，生成新端点表');
         await generateEndpointTable(env.DB);
       }
-      
-      // 处理 token 缓存
-      tokenCache = d1Tokens || new Map();
+
+      tokenCache.clear();
+      if (d1Tokens) {
+        for (const [region, data] of d1Tokens) {
+          tokenCache.set(region, data);
+        }
+      }
       const now = Date.now();
       let validTokenCount = 0;
-      
       for (const [region, data] of tokenCache) {
         if (data.expiry && data.expiry > now) {
-           const timeInfo = formatRemainingTime(data.expiry);
-           console.log(`🎫 从D1加载token: ${region}(优先级${data.priority}, 有效期${timeInfo.text})`);
-           validTokenCount++;
-         }
+          const timeInfo = formatRemainingTime(data.expiry);
+          console.log(`🎫 从D1加载token: ${region}(优先级${data.priority}, 有效期${timeInfo.text})`);
+          validTokenCount++;
+        }
       }
-      
       if (validTokenCount > 0) {
         console.log(`🎫 共${validTokenCount}个有效token`);
       } else {
         console.log('🎫 无有效token缓存');
       }
-      
-      // 处理语音列表
+
       if (d1Voices && d1Voices.length > 0) {
         mergedVoiceListCache = d1Voices;
         console.log(`🎤 从D1加载语音列表: ${d1Voices.length}个语音`);
@@ -848,125 +1047,127 @@ async function initialize(env) {
         console.log('🎤 D1无语音列表，将从端点表生成');
         await generateMergedVoiceList();
       }
-      
+
       isInitialized = true;
       console.log(`✅ 初始化完成: ${Date.now() - startTime}ms`);
-      
     } catch (error) {
       console.error('❌ 初始化失败:', error);
-      isInitialized = true; // 即使失败也标记为已初始化，避免无限重试
-      throw error; // 重新抛出错误
+      lastInitFailureAt = Date.now();
+      throw error;
     } finally {
-      initializationPromise = null; // 清理 Promise
+      initializationPromise = null;
     }
   })();
-  
+
   return initializationPromise;
 }
 
-// ============ 请求处理 ============
+// ============ 请求解析 ============
 
 async function parseTTSRequest(request) {
   const params = {};
-  
-  // 辅助函数：清理风格
+
   function cleanStyle(rawStyle) {
     return (rawStyle || '').replace(/[{}]/g, '').trim();
   }
-  
-  if (request.method === '') {
+
+  if (request.method === 'POST') {
     const contentType = request.headers.get('Content-Type') || '';
     const bodyText = await request.text();
-    
-    console.log(`📥  请求: Content-Type: ${contentType}`);
-    
+
+    console.log(`📥 POST 请求: Content-Type: ${contentType}`);
+
     if (contentType.includes('application/json')) {
-      // JSON 格式
       try {
         const data = JSON.parse(bodyText);
+        const rawRate = Number(data.rate || data.r) || 0;
+        const rawPitch = Number(data.pitch || data.p) || 0;
+        const rawFormat = data.outputFormat || data.o || 'audio-24khz-48kbitrate-mono-mp3';
+
         Object.assign(params, {
           apiKey: data.api_key || '',
           text: data.text || data.t || '',
           voiceName: data.voice || data.v || '',
-          rate: Number(data.rate || data.r) || 0,
-          pitch: Number(data.pitch || data.p) || 0,
-          style: cleanStyle(data.style || data.s || 'general'),  // ✅ 清理
-          outputFormat: data.outputFormat || data.o || 'audio-24khz-48kbitrate-mono-mp3',
-          download: data.download === true || data.d === 'true'
+          rate: clamp(rawRate, RATE_MIN, RATE_MAX),
+          pitch: clamp(rawPitch, PITCH_MIN, PITCH_MAX),
+          style: cleanStyle(data.style || data.s || 'general'),
+          outputFormat: OUTPUT_FORMAT_PATTERN.test(rawFormat) ? rawFormat : 'audio-24khz-48kbitrate-mono-mp3',
+          download: data.download === true || data.d === 'true' || data.download === 'true'
         });
       } catch (error) {
         console.error('  ❌ JSON 解析失败:', error.message);
       }
     } else {
-      // 表单格式
       const formData = new URLSearchParams(bodyText);
-      
+      const rawRate = Number(formData.get('r') || formData.get('rate')) || 0;
+      const rawPitch = Number(formData.get('p') || formData.get('pitch')) || 0;
+      const rawFormat = formData.get('o') || 'audio-24khz-48kbitrate-mono-mp3';
+
       Object.assign(params, {
         apiKey: formData.get('api_key') || '',
         text: formData.get('t') || formData.get('text') || '',
         voiceName: formData.get('v') || formData.get('voice') || '',
-        rate: Number(formData.get('r') || formData.get('rate')) || 0,
-        pitch: Number(formData.get('p') || formData.get('pitch')) || 0,
-        style: cleanStyle(formData.get('s') || formData.get('style') || 'general'),  // ✅ 清理
-        outputFormat: formData.get('o') || 'audio-24khz-48kbitrate-mono-mp3',
-        download: formData.get('d') === 'true'
+        rate: clamp(rawRate, RATE_MIN, RATE_MAX),
+        pitch: clamp(rawPitch, PITCH_MIN, PITCH_MAX),
+        style: cleanStyle(formData.get('s') || formData.get('style') || 'general'),
+        outputFormat: OUTPUT_FORMAT_PATTERN.test(rawFormat) ? rawFormat : 'audio-24khz-48kbitrate-mono-mp3',
+        download: formData.get('d') === 'true' || formData.get('download') === 'true'
       });
     }
   } else {
-    // GET 方式
     const sp = new URL(request.url).searchParams;
     console.log('📥 GET 请求参数:', request.url);
-    
+    const rawRate = Number(sp.get('r')) || 0;
+    const rawPitch = Number(sp.get('p')) || 0;
+    const rawFormat = sp.get('o') || 'audio-24khz-48kbitrate-mono-mp3';
+
     Object.assign(params, {
       apiKey: sp.get('api_key') || '',
       text: sp.get('t') || '',
       voiceName: sp.get('v') || '',
-      rate: Number(sp.get('r')) || 0,
-      pitch: Number(sp.get('p')) || 0,
-      style: cleanStyle(sp.get('s') || 'general'),  // ✅ 清理
-      outputFormat: sp.get('o') || 'audio-24khz-48kbitrate-mono-mp3',
+      rate: clamp(rawRate, RATE_MIN, RATE_MAX),
+      pitch: clamp(rawPitch, PITCH_MIN, PITCH_MAX),
+      style: cleanStyle(sp.get('s') || 'general'),
+      outputFormat: OUTPUT_FORMAT_PATTERN.test(rawFormat) ? rawFormat : 'audio-24khz-48kbitrate-mono-mp3',
       download: sp.get('d') === 'true'
     });
   }
-  
+
   return params;
 }
+
+// ============ 主请求处理 ============
 
 async function handleRequest(request, env) {
   const requestUrl = new URL(request.url);
   const path = requestUrl.pathname;
 
-
-// 显示边缘节点  
   const colo = request.cf?.colo || 'unknown';
   console.log(`📍 边缘节点: ${colo}, 路径: ${path}`);
-// 已知路由列表
-  const routes = {
-    '/tts': true,
-    '/api/v1/tts': true,
-    '/voices': true,
-    '/api/v1/voices': true,
-    '/endpoints': true,
-    '/health': true,
-    '/reader.json': true,
-    '/reader-post.json': true,
-    '/ifreetime.json': true,
-    '/v1/audio/speech': true,
-    '/audio/speech': true,
-    '/get-token': true,    
-    '/': true
-  };
 
-  // 未知路径返回 404
-  if (!routes[path]) {
+  const routes = new Set([
+    '/tts', '/api/v1/tts', '/voices', '/api/v1/voices',
+    '/endpoints', '/health', '/reader.json', '/reader-post.json',
+    '/ifreetime.json', '/v1/audio/speech', '/audio/speech',
+    '/get-token', '/'
+  ]);
+
+  if (!routes.has(path)) {
     console.warn(`🚫 未知路径: ${path}`);
     return new Response('Not Found', { status: 404 });
   }
 
-// ============ 语音转换 ============
+  // ============ TTS ============
   if (path === '/tts' || path === '/api/v1/tts') {
     const params = await parseTTSRequest(request);
-    
+
+    if (!params.text) {
+      return createJsonResponse({ error: 'Missing required field: text' }, 400);
+    }
+    if (params.text.length > MAX_TEXT_LENGTH) {
+      return createJsonResponse({ error: `Text too long: ${params.text.length} (max ${MAX_TEXT_LENGTH})` }, 400);
+    }
+
     if (!params.voiceName || !params.style) {
       const mergedVoices = await getMergedVoiceList(env.DB);
       if (mergedVoices.length > 0) {
@@ -977,19 +1178,19 @@ async function handleRequest(request, env) {
         }
       }
     }
-    
+
     if (!validateApiKey(params.apiKey, env)) {
       return createJsonResponse({ error: 'Unauthorized' }, 401);
     }
-    
+
     return await getVoice(
-      env.DB, 
-      params.text, 
-      params.voiceName, 
-      params.rate, 
-      params.pitch, 
-      params.style, 
-      params.outputFormat, 
+      env.DB,
+      params.text,
+      params.voiceName,
+      params.rate,
+      params.pitch,
+      params.style,
+      params.outputFormat,
       params.download
     );
   }
@@ -1011,7 +1212,8 @@ async function handleRequest(request, env) {
       }))
     });
   }
-// ============ 健康查询 ============
+
+  // ============ 健康 ============
   if (path === '/health') {
     return createJsonResponse({
       status: 'ok',
@@ -1020,10 +1222,10 @@ async function handleRequest(request, env) {
       tokenCacheSize: tokenCache.size
     });
   }
-// ============ reader.json 路由 ============
+
+  // ============ reader.json ============
   if (path === '/reader.json') {
     const apiKey = requestUrl.searchParams.get('api_key');
-
     if (!validateApiKey(apiKey, env)) {
       return createJsonResponse({
         error: 'Unauthorized',
@@ -1040,63 +1242,47 @@ async function handleRequest(request, env) {
 
     const baseUrl = `${requestUrl.protocol}//${requestUrl.host}`;
     const urlParams = ["t={{java.encodeURI(speakText)}}", "r={{speakSpeed*4}}"];
-
     if (voice) urlParams.push(`v=${voice}`);
     if (pitch) urlParams.push(`p=${pitch}`);
     if (style) urlParams.push(`s=${style}`);
-    if (apiKey) urlParams.push(`api_key=${apiKey}`);
+    if (apiKey) urlParams.push(`api_key=${encodeURIComponent(apiKey)}`);
 
     const url = `${baseUrl}/tts?${urlParams.join('&')}`;
-
-    return createJsonResponse({
-      id: Date.now(),
-      name: displayName,
-      url: url
-    });
+    return createJsonResponse({ id: Date.now(), name: displayName, url: url });
   }
 
-if (path === '/reader-post.json') {
-  const apiKey = requestUrl.searchParams.get('api_key');
+  // ============ reader-post.json ============
+  if (path === '/reader-post.json') {
+    const apiKey = requestUrl.searchParams.get('api_key');
+    if (!validateApiKey(apiKey, env)) {
+      return createJsonResponse({ error: 'Unauthorized' }, 401);
+    }
 
-  if (!validateApiKey(apiKey, env)) {
-    return createJsonResponse({ error: 'Unauthorized' }, 401);
+    const voice = requestUrl.searchParams.get('v') || '';
+    const rate = requestUrl.searchParams.get('r') || '0';
+    const pitch = requestUrl.searchParams.get('p') || '0';
+    const style = requestUrl.searchParams.get('s') || 'general';
+    const displayName = requestUrl.searchParams.get('n') || 'Microsoft TTS';
+    const baseUrl = `${requestUrl.protocol}//${requestUrl.host}`;
+    const ttsUrl = `${baseUrl}/tts`;
+
+    const bodyParts = [
+      't={{java.encodeURI(speakText)}}',
+      `r={{speakSpeed}}`,
+      `v=${voice}`,
+      `p=${pitch}`,
+      `s=${style}`
+    ];
+    if (apiKey) bodyParts.push(`api_key=${encodeURIComponent(apiKey)}`);
+    const body = bodyParts.join('&');
+    const fullUrl = `${ttsUrl},{\n    "method": "POST",\n    "body": "${body}"\n}`;
+
+    return createJsonResponse({ id: Date.now(), name: displayName, url: fullUrl });
   }
 
-  const voice = requestUrl.searchParams.get('v') || '';
-  const rate = requestUrl.searchParams.get('r') || '0';
-  const pitch = requestUrl.searchParams.get('p') || '0';
-  const style = requestUrl.searchParams.get('s') || 'general';
-  const displayName = requestUrl.searchParams.get('n') || 'Microsoft TTS';
-  const baseUrl = `${requestUrl.protocol}//${requestUrl.host}`;
-  const ttsUrl = `${baseUrl}/tts`;
-  
-  // 构建 body
-  const bodyParts = [
-    't={{java.encodeURI(speakText)}}',
-    `r={{speakSpeed}}`,
-    `v=${voice}`,
-    `p=${pitch}`,
-    `s=${style}`
-  ];
-  
-  if (apiKey) bodyParts.push(`api_key=${apiKey}`);
-  
-  const body = bodyParts.join('&');
-  
-  // 构建完整的 url 字段（包含 method 和 body）
-  const fullUrl = `${ttsUrl},{\n    "method": "POST",\n    "body": "${body}"\n}`;
-
-  return createJsonResponse({
-    id: Date.now(),
-    name: displayName,
-    url: fullUrl
-  });
-}
-
-  // ============ ifreetime.json 路由 ============
+  // ============ ifreetime.json ============
   if (path === '/ifreetime.json') {
     const apiKey = requestUrl.searchParams.get('api_key');
-
     if (!validateApiKey(apiKey, env)) {
       return createJsonResponse({
         error: 'Unauthorized',
@@ -1122,7 +1308,6 @@ if (path === '/reader-post.json') {
       "p": pitch,
       "s": style
     };
-
     if (apiKey) params["api_key"] = apiKey;
 
     const response = {
@@ -1133,77 +1318,104 @@ if (path === '/reader-post.json') {
       _TTSName: displayName,
       _ClassName: "JxdAdvCustomTTS",
       _TTSConfigID: ttsConfigID,
-      httpConfigs: {
-        useCookies: 1,
-        headers: {}
-      },
+      httpConfigs: { useCookies: 1, headers: {} },
       voiceList: [],
-      ttsHandles: [
-        {
-          paramsEx: "",
-          processType: 1,
-          maxPageCount: 1,
-          nextPageMethod: 1,
-          method: 1,
-          requestByWebView: 0,
-          parser: {},
-          nextPageParams: {},
-          url: url,
-          params: params,
-          httpConfigs: {
-            useCookies: 1,
-            headers: {}
-          }
-        }
-      ]
+      ttsHandles: [{
+        paramsEx: "",
+        processType: 1,
+        maxPageCount: 1,
+        nextPageMethod: 1,
+        method: 1,
+        requestByWebView: 0,
+        parser: {},
+        nextPageParams: {},
+        url: url,
+        params: params,
+        httpConfigs: { useCookies: 1, headers: {} }
+      }]
     };
 
     return createJsonResponse(response);
   }
 
-  // ============ OpenAI 兼容接口 ============
+  // ============ OpenAI 兼容 ============
   if (path === '/v1/audio/speech' || path === '/audio/speech') {
     return await handleOpenAITTS(request, env);
   }
-  
-    // ============ 获取 Token 路由 ============
-  if (path === '/get-token') {
-  const requester = request.headers.get('X-Token-Requester') || 'unknown'; //获取访问者的请求头
-  recentRequesters.set(requester, Date.now());  // 将请求者标记和时间戳保存到 Map 中
-  // 清理过期记录
-  for (const [key, timestamp] of recentRequesters) {
-    if (Date.now() - timestamp > BLOCK_DURATION) {
-      recentRequesters.delete(key);
-    }
-  }  
-  console.log(`📝 远方服务器请求获取 token,请求来源: ${requester}`);
 
-    const apiKey = requestUrl.searchParams.get('api_key') || 
-                   request.headers.get('X-API-Key') || '';
-    
-    const expectedApiKey = env.API_KEY;
-    
-    // 验证 API Key
-    if (apiKey !== expectedApiKey) {
-      console.warn('❌ 获取token服务API Key 验证失败');
-      return createJsonResponse({ 
-        success: false, 
-        error: 'Unauthorized: Invalid API key' 
-      }, 401);
-    }       
-    console.log('🔑 token服务API Key 验证通过');    
-        // 获取请求参数（语音和风格，可选）
+  // ============ /get-token（严格模式） ============
+  if (path === '/get-token') {
+    const requester = request.headers.get('X-Node-Id') || '';
+
+    const allowed = getAllowedNodeIds();
+    if (!requester || !allowed.has(requester)) {
+      console.warn(`❌ /get-token 拒绝未知节点: "${requester}"`);
+      return createJsonResponse({ success: false, error: 'Unauthorized: Unknown node' }, 401);
+    }
+
+    const secret = env.WORKER_SHARED_SECRET;
+    if (!secret) {
+      console.error('❌ WORKER_SHARED_SECRET 未配置，/get-token 不可用');
+      return createJsonResponse({ success: false, error: 'Server misconfigured' }, 500);
+    }
+
+    const ts = request.headers.get('X-TS');
+    const auth = request.headers.get('X-Auth');
+    if (!ts || !auth) {
+      console.warn(`❌ /get-token 缺少 X-TS / X-Auth (node=${requester})`);
+      return createJsonResponse({ success: false, error: 'Unauthorized: Missing auth' }, 401);
+    }
+
+    const tsNum = Number(ts);
+    if (!Number.isFinite(tsNum) || Math.abs(Date.now() - tsNum) > NODE_AUTH_MAX_SKEW_MS) {
+      console.warn(`❌ /get-token 时间戳超出窗口 (node=${requester}, ts=${ts})`);
+      return createJsonResponse({ success: false, error: 'Unauthorized: Timestamp out of window' }, 401);
+    }
+
+    const expectedAuth = await computeNodeAuth(secret, requester, ts);
+    if (!timingSafeEqualStr(expectedAuth, auth)) {
+      console.warn(`❌ /get-token X-Auth 校验失败 (node=${requester})`);
+      return createJsonResponse({ success: false, error: 'Unauthorized: Bad auth' }, 401);
+    }
+
+    const apiKey = request.headers.get('X-API-Key') || '';
+    if (!apiKey || !validateApiKey(apiKey, env)) {
+      console.warn(`❌ /get-token API Key 校验失败 (node=${requester})`);
+      return createJsonResponse({ success: false, error: 'Unauthorized: Invalid API key' }, 401);
+    }
+
+    cleanupNodeRateLimit();
+    if (!checkNodeRateLimit(requester)) {
+      console.warn(`🚦 节点 ${requester} 触发限流`);
+      return createJsonResponse({ success: false, error: 'Too Many Requests' }, 429);
+    }
+
+    recentRequesters.set(requester, Date.now());
+    for (const [key, timestamp] of recentRequesters) {
+      if (Date.now() - timestamp > BLOCK_DURATION) recentRequesters.delete(key);
+    }
+    if (recentRequesters.size > RECENT_REQUESTERS_MAX) {
+      recentRequesters.delete(recentRequesters.keys().next().value);
+    }
+
+    console.log(`📝 节点 ${requester} 请求获取 token`);
+
     const voiceName = requestUrl.searchParams.get('v') || 'zh-CN-XiaoxiaoNeural';
     const style = requestUrl.searchParams.get('s') || 'general';
-    
-    console.log(`🔑 远方服务器请求获取: 语音=${voiceName}, 风格=${style}`);
-    
-    // 使用 getBestToken 获取最佳 token
+
+    if (!VOICE_STYLE_PATTERN.test(voiceName)) {
+      console.warn(`❌ /get-token 非法 voiceName 格式: ${voiceName} (node=${requester})`);
+      return createJsonResponse({ success: false, error: 'Unauthorized: Invalid voice format' }, 400);
+    }
+    if (!VOICE_STYLE_PATTERN.test(style)) {
+      console.warn(`❌ /get-token 非法 style 格式: ${style} (node=${requester})`);
+      return createJsonResponse({ success: false, error: 'Unauthorized: Invalid style format' }, 400);
+    }
+
     const bestToken = await getBestToken(env.DB, voiceName, style);
-    
     if (bestToken) {
       const timeInfo = formatRemainingTime(bestToken.expiry);
-      console.log(`🔑 远方服务器请求token成功: 区域=${bestToken.region}, 优先级=${bestToken.priority}, 有效期=${timeInfo.text}`);
+      console.log(`🔑 节点 ${requester} 获取token成功: 区域=${bestToken.region}, 优先级=${bestToken.priority}, 有效期=${timeInfo.text}`);
       return createJsonResponse({
         success: true,
         region: bestToken.region,
@@ -1214,47 +1426,65 @@ if (path === '/reader-post.json') {
         remainingSeconds: timeInfo.seconds
       });
     }
-    
-    return createJsonResponse({ 
-      success: false, 
-      error: 'Failed to get token' 
-    }, 500);
+
+    // ⚠️-2：无可用 token 返回 503 + Retry-After
+    return new Response(JSON.stringify({
+      success: false,
+      error: 'No matching token available, retry later'
+    }), {
+      status: 503,
+      headers: {
+        'Content-Type': 'application/json',
+        'Retry-After': '10'
+      }
+    });
   }
 
-
-  // ============ 默认返回主页 ============
+  // ============ 默认主页 ============
   return new Response(getWebInterface(), {
     status: 200,
     headers: { 'Content-Type': 'text/html; charset=utf-8' }
   });
 }
 
-// ============ OpenAI TTS 处理函数 ============
+// ============ OpenAI TTS ============
+
 async function handleOpenAITTS(request, env) {
   if (request.method !== 'POST') {
-    return createJsonResponse({ error: 'Method not allowed' }, 405);
+    return createOpenAIError('Method not allowed', 405, 'invalid_request_error', 'method_not_allowed');
   }
 
   const authHeader = request.headers.get('Authorization');
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return createJsonResponse({ error: 'Unauthorized: Missing or invalid API key' }, 401);
+    return createOpenAIError('Missing or invalid Authorization header', 401, 'invalid_request_error', 'invalid_api_key');
   }
 
   const apiKey = authHeader.replace('Bearer ', '');
   if (!validateApiKey(apiKey, env)) {
-    return createJsonResponse({ error: 'Unauthorized: Invalid API key' }, 401);
+    return createOpenAIError('Invalid API key', 401, 'invalid_request_error', 'invalid_api_key');
   }
 
   try {
     const requestData = await request.json();
 
     if (!requestData.input) {
-      return createJsonResponse({ error: 'Bad request: Missing input' }, 400);
+      return createOpenAIError('Missing required field: input', 400, 'invalid_request_error', 'missing_input');
     }
 
     const text = requestData.input;
+
+    if (text.length > MAX_TEXT_LENGTH) {
+      console.warn(`⚠️ OpenAI TTS input 超长: ${text.length} > ${MAX_TEXT_LENGTH}`);
+      return createOpenAIError(
+        `Input too long: ${text.length} chars (max ${MAX_TEXT_LENGTH})`,
+        400,
+        'invalid_request_error',
+        'input_too_long'
+      );
+    }
+
     let voiceName = 'zh-CN-XiaoxiaoNeural';
-    
+
     if (requestData.voice) {
       const voiceMap = {
         'alloy': 'zh-CN-XiaoxiaoNeural',
@@ -1264,13 +1494,20 @@ async function handleOpenAITTS(request, env) {
         'nova': 'zh-CN-XiaochenNeural',
         'shimmer': 'zh-CN-XiaoxiaoMultilingualNeural'
       };
-      voiceName = voiceMap[requestData.voice] || requestData.voice;
+      const mapped = voiceMap[requestData.voice] || requestData.voice;
+      const merged = await getMergedVoiceList(env.DB);
+      if (merged.find(v => v.ShortName === mapped)) {
+        voiceName = mapped;
+      } else {
+        console.warn(`⚠️ OpenAI voice "${requestData.voice}" 映射到 ${mapped} 不存在，回退默认`);
+        voiceName = 'zh-CN-XiaoxiaoNeural';
+      }
     }
 
     let rate = 0;
     if (requestData.speed) {
       rate = Math.round((requestData.speed - 1.0) * 100);
-      rate = Math.max(-100, Math.min(100, rate));
+      rate = clamp(rate, RATE_MIN, RATE_MAX);
     }
 
     const outputFormat = requestData.response_format === 'opus' ?
@@ -1289,12 +1526,12 @@ async function handleOpenAITTS(request, env) {
     );
   } catch (error) {
     console.error('OpenAI TTS error:', error);
-    return createJsonResponse({ error: 'Internal server error: ' + error.message }, 500);
+    return createOpenAIError('Internal server error: ' + error.message, 500, 'server_error', 'internal_error');
   }
 }
 
+// ============ Web 界面 ============
 
-// Web 界面（完整版）- 保持原有代码，只优化了部分重复
 function getWebInterface() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1470,14 +1707,14 @@ function getWebInterface() {
       const pitch = document.getElementById('pitch').value;
       const style = document.getElementById('style').value;
       const displayName = document.getElementById('voice').options[document.getElementById('voice').selectedIndex].text || '微软TTS';
-      
+
       if (apiKey) params.append('api_key', apiKey);
       if (voice) params.append('v', voice);
       if (rate) params.append('r', rate);
       if (pitch) params.append('p', pitch);
       if (style) params.append('s', style);
       params.append('n', displayName);
-      
+
       return window.location.origin + '/' + endpoint + '?' + params.toString();
     }
 
@@ -1547,13 +1784,13 @@ function getWebInterface() {
           allVoices = await response.json();
           const voiceSelect = document.getElementById('voice');
           voiceSelect.innerHTML = '';
-          
+
           const voiceGroups = [
             { name: 'MAI 系列', filter: v => v.ShortName.includes('MAI-Voice') },
             { name: 'Dragon HD 系列', filter: v => v.ShortName.includes('Dragon') && !v.ShortName.includes('MAI') },
             { name: '标准系列', filter: v => !v.ShortName.includes('Dragon') && !v.ShortName.includes('MAI') }
           ];
-          
+
           voiceGroups.forEach(group => {
             const voices = allVoices.filter(group.filter);
             if (voices.length > 0) {
@@ -1563,7 +1800,7 @@ function getWebInterface() {
               voiceSelect.appendChild(optgroup);
             }
           });
-          
+
           if (allVoices.length > 0) {
             voiceSelect.value = allVoices[0].ShortName;
             updateStyleOptions(allVoices[0].ShortName);
@@ -1595,7 +1832,7 @@ function getWebInterface() {
 
       try {
         cleanupAudioUrl();
-        
+
         const response = await fetch('/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1608,7 +1845,7 @@ function getWebInterface() {
 
         if (!response.ok) {
           const errorData = await response.json().catch(() => null);
-          throw new Error(errorData?.message || '请求失败');
+          throw new Error(errorData?.error?.message || errorData?.message || '请求失败');
         }
 
         const audioBlob = await response.blob();
@@ -1644,7 +1881,7 @@ function getWebInterface() {
       });
 
       document.getElementById('getReaderLinkBtn').addEventListener('click', function() {
-        window.open(generateReaderLink('reader-post.json'), '_blank');        
+        window.open(generateReaderLink('reader-post.json'), '_blank');
       });
 
       document.getElementById('getIFreeTimeLinkBtn').addEventListener('click', function() {
@@ -1688,26 +1925,35 @@ function getWebInterface() {
 </html>`;
 }
 
-// ============ 导出默认对象 ============
+// ============ 导出 ============
 
 export default {
   async fetch(request, env) {
-    // 确保初始化（初始化 Promise 防并发）
     if (!isInitialized) {
       try {
         await initialize(env);
       } catch (error) {
-        // 初始化失败，返回错误响应
+        if (error.code === 'INIT_COOLDOWN') {
+          return createJsonResponse({ error: 'Service temporarily unavailable' }, 503);
+        }
         console.error('❌ 服务初始化失败:', error);
         return createJsonResponse({ error: 'Service initialization failed' }, 500);
       }
     }
-    
+
     return handleRequest(request, env);
   },
-  
+
   async scheduled(event, env) {
+    if (!env.DB) {
+      console.error('⏰ scheduled: env.DB 未绑定，跳过');
+      return;
+    }
     console.log('⏰ 定时任务触发，重新生成端点表');
-    await generateEndpointTable(env.DB);
+    try {
+      await generateEndpointTable(env.DB);
+    } catch (error) {
+      console.error('⏰ scheduled 生成端点表失败:', error);
+    }
   }
 };
