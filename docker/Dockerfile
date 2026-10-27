@@ -1,16 +1,7 @@
-# ============ 构建阶段 ============
-FROM node:20-alpine AS builder
-
-WORKDIR /app
-COPY docker/package.json ./
-RUN npm install --omit=dev
-
-# ============ 运行阶段 ============
 FROM node:20-alpine
 
 WORKDIR /app
 
-COPY --from=builder /app/node_modules ./node_modules
 COPY docker/package.json ./
 COPY docker/server.js docker/d1-json.js ./
 COPY worker.js ./
