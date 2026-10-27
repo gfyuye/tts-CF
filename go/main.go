@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -81,12 +82,45 @@ func handleGetToken(w http.ResponseWriter, r *http.Request, apiKey string) {
 	writeJSON(w, status, result)
 }
 
+// loadConfig 从环境变量读取配置，应用默认值
+func loadConfig() {
+	// TOKEN_TIMEOUT_MS：单次请求超时，默认 2000ms
+	if v := strings.TrimSpace(os.Getenv("TOKEN_TIMEOUT_MS")); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			dynamicTokenTimeout = time.Duration(ms) * time.Millisecond
+			log.Printf("⚙️  TOKEN_TIMEOUT_MS=%dms", ms)
+		} else {
+			log.Printf("⚠️ TOKEN_TIMEOUT_MS 无效: %q，使用默认 2000ms", v)
+		}
+	} else {
+		log.Printf("⚙️  TOKEN_TIMEOUT_MS 未设置，使用默认 2000ms")
+	}
+
+	// TOKEN_MAX_ATTEMPTS：最多尝试次数，默认 3
+	if v := strings.TrimSpace(os.Getenv("TOKEN_MAX_ATTEMPTS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxAttempts = n
+			log.Printf("⚙️  TOKEN_MAX_ATTEMPTS=%d", n)
+		} else {
+			log.Printf("⚠️ TOKEN_MAX_ATTEMPTS 无效: %q，使用默认 3", v)
+		}
+	} else {
+		log.Printf("⚙️  TOKEN_MAX_ATTEMPTS 未设置，使用默认 3")
+	}
+}
+
 func main() {
 	apiKey := strings.TrimSpace(os.Getenv("API_KEY"))
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8788"
 	}
+
+	// 加载超时/重试配置
+	loadConfig()
+
+	// 初始化 HTTP Client（依赖 dynamicTokenTimeout）
+	initHTTPClient()
 
 	mux := http.NewServeMux()
 
@@ -102,8 +136,10 @@ func main() {
 			apiKeyStatus = "configured"
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"status": "ok",
-			"apiKey": apiKeyStatus,
+			"status":         "ok",
+			"apiKey":         apiKeyStatus,
+			"timeoutMs":      dynamicTokenTimeout.Milliseconds(),
+			"maxAttempts":    maxAttempts,
 		})
 	})
 
@@ -113,8 +149,8 @@ func main() {
 	defer baseCancel()
 
 	server := &http.Server{
-		Addr:        addr,
-		Handler:     mux,
+		Addr:         addr,
+		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
