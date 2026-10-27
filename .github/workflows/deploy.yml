@@ -23,7 +23,10 @@ jobs:
         run: npm ci
 
       - name: Install Wrangler
-        run: npm install -g wrangler@3
+        run: npm install -g wrangler@4
+
+      - name: Verify Wrangler version
+        run: wrangler --version
 
       - name: Verify required secrets
         env:
@@ -63,7 +66,8 @@ jobs:
         run: |
           DB_NAME="tts-db"
           echo "🔍 查询 D1 数据库: $DB_NAME"
-          LIST_JSON=$(wrangler d1 list --json 2>/dev/null || echo "[]")
+          # v4 默认本地模式，必须加 --remote 查远程
+          LIST_JSON=$(wrangler d1 list --remote --json 2>/dev/null || echo "[]")
           DB_ID=$(echo "$LIST_JSON" | node -e "
             const data = JSON.parse(require('fs').readFileSync(0, 'utf8'));
             const found = data.find(d => d.name === '$DB_NAME');
@@ -115,6 +119,7 @@ jobs:
           fi
 
           echo "✅ wrangler.toml 已更新"
+          cat wrangler.toml
 
       - name: Initialize D1 schema
         env:
@@ -154,5 +159,6 @@ jobs:
           echo "| Worker | \`tts-cf\` |" >> $GITHUB_STEP_SUMMARY
           echo "| D1 | \`tts-db\` |" >> $GITHUB_STEP_SUMMARY
           echo "| 节点 ID | \`$NODE_ID\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Placement | \`azure:southeastasia\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "访问：https://tts-cf.<subdomain>.workers.dev" >> $GITHUB_STEP_SUMMARY
