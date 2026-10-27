@@ -1,22 +1,7 @@
 name: Build go and Release
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'go/**'
-      - '.github/workflows/build.yml'
-  push:
-    tags:
-      - 'v*'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'go/**'
-  workflow_dispatch:
-
-permissions:
-  contents: write
+  workflow_dispatch:   # 仅手动触发，push 不触发
 
 jobs:
   test:
