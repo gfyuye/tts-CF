@@ -16,3 +16,6 @@ crons = ["0 */6 * * *"]
 
 [observability]
 enabled = true
+
+[placement]
+region = "azure:southeastasia"
