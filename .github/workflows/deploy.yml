@@ -1,6 +1,8 @@
 name: Deploy to Cloudflare Workers
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -23,131 +25,50 @@ jobs:
       - name: Install Wrangler
         run: npm install -g wrangler@3
 
-      - name: Verify required secrets
-        env:
-          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          API_KEY: ${{ secrets.API_KEY }}
-          SHARED_SECRET: ${{ secrets.WORKER_SHARED_SECRET }}
-          NODE_ID: ${{ vars.WORKER_NODE_ID }}
-        run: |
-          missing=0
-          for v in CF_API_TOKEN CF_ACCOUNT_ID API_KEY SHARED_SECRET NODE_ID; do
-            if [ -z "${!v}" ]; then
-              echo "❌ 缺少配置：$v"
-              missing=1
-            fi
-          done
-          if [ "$missing" = "1" ]; then
-            echo ""
-            echo "请在 GitHub 仓库 Settings → Secrets and variables → Actions 中配置："
-            echo "  Secrets:"
-            echo "    CLOUDFLARE_API_TOKEN"
-            echo "    CLOUDFLARE_ACCOUNT_ID"
-            echo "    API_KEY"
-            echo "    WORKER_SHARED_SECRET"
-            echo "  Variables:"
-            echo "    WORKER_NODE_ID"
-            echo "    REMOTETOKEN (可选，多节点时填写)"
-            exit 1
-          fi
-          echo "✅ 配置检查通过"
-
-      - name: Ensure D1 database exists
-        id: d1
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          DB_NAME="tts-db"
-          echo "🔍 查询 D1 数据库: $DB_NAME"
-          LIST_JSON=$(wrangler d1 list --json 2>/dev/null || echo "[]")
-          DB_ID=$(echo "$LIST_JSON" | node -e "
-            const data = JSON.parse(require('fs').readFileSync(0, 'utf8'));
-            const found = data.find(d => d.name === '$DB_NAME');
-            console.log(found ? found.uuid : '');
-          ")
-          if [ -z "$DB_ID" ]; then
-            echo "📦 创建 D1 数据库: $DB_NAME"
-            CREATE_OUT=$(wrangler d1 create "$DB_NAME" 2>&1)
-            echo "$CREATE_OUT"
-            DB_ID=$(echo "$CREATE_OUT" | grep -oE 'database_id = "[^"]+"' | head -1 | sed 's/database_id = "//;s/"//')
-          fi
-          if [ -z "$DB_ID" ]; then
-            echo "❌ 无法获取 database_id"
-            exit 1
-          fi
-          echo "✅ database_id: $DB_ID"
-          echo "db_id=$DB_ID" >> "$GITHUB_OUTPUT"
-
-      - name: Patch wrangler.toml with database_id
+      - name: Patch wrangler.toml with vars
         env:
           DB_ID: ${{ steps.d1.outputs.db_id }}
           NODE_ID: ${{ vars.WORKER_NODE_ID }}
           REMOTETOKEN: ${{ vars.REMOTETOKEN }}
         run: |
-          # 注入 database_id
-          sed -i "s/REPLACE_WITH_YOUR_DATABASE_ID/$DB_ID/" wrangler.toml
+          # 注入 database_id（若已有占位符）
+          if [ -n "$DB_ID" ]; then
+            sed -i "s/REPLACE_WITH_YOUR_DATABASE_ID/$DB_ID/" wrangler.toml
+          fi
 
-          # 注入 WORKER_NODE_ID（trim）
+          # 注入 WORKER_NODE_ID
           if [ -n "$NODE_ID" ]; then
             TRIMMED_NODE_ID=$(echo "$NODE_ID" | xargs)
             sed -i "s|^WORKER_NODE_ID = .*|WORKER_NODE_ID = \"$TRIMMED_NODE_ID\"|" wrangler.toml
           fi
 
-          # 注入 REMOTETOKEN（trim + 换行转 \n + 转义特殊字符）
+          # 注入 REMOTETOKEN（JSON.stringify 转义，最健壮）
           if [ -n "$REMOTETOKEN" ]; then
-            node -e "
-              const fs = require('fs');
-              let t = fs.readFileSync('wrangler.toml', 'utf8');
+            node -e '
+              const fs = require("fs");
+              let t = fs.readFileSync("wrangler.toml", "utf8");
               let val = process.env.REMOTETOKEN.trim();
-              val = val.replace(/\\\\/g, '\\\\\\\\').replace(/\"/g, '\\\\\"');
-              val = val.replace(/\n/g, '\\n');
-              t = t.replace(/^REMOTETOKEN = .*$/m, 'REMOTETOKEN = \"' + val + '\"');
-              fs.writeFileSync('wrangler.toml', t);
-            "
+              const tomlValue = JSON.stringify(val);
+              t = t.replace(/^REMOTETOKEN = .*$/m, "REMOTETOKEN = " + tomlValue);
+              fs.writeFileSync("wrangler.toml", t);
+            '
           fi
 
-          echo "✅ wrangler.toml 已更新"
+          echo "=== wrangler.toml ==="
           cat wrangler.toml
+          echo "=== 第 7 行字节 ==="
+          sed -n '7p' wrangler.toml | od -c | head -10
 
-      - name: Initialize D1 schema
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Validate wrangler.toml
         run: |
-          wrangler d1 execute tts-db --remote --file=schema.sql
-          echo "✅ D1 表结构已初始化"
-
-      - name: Deploy Worker
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy
-
-      - name: Set Worker Secrets
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          API_KEY: ${{ secrets.API_KEY }}
-          SHARED_SECRET: ${{ secrets.WORKER_SHARED_SECRET }}
-        run: |
-          echo "🔐 设置 Worker Secrets..."
-          echo "$API_KEY" | wrangler secret put API_KEY
-          echo "$SHARED_SECRET" | wrangler secret put WORKER_SHARED_SECRET
-          echo "✅ Secrets 已设置"
-
-      - name: Summary
-        env:
-          NODE_ID: ${{ vars.WORKER_NODE_ID }}
-        run: |
-          echo "## ✅ 部署完成" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| 项 | 值 |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| Worker | \`tts-cf\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| D1 | \`tts-db\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| 节点 ID | \`$NODE_ID\` |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "访问：https://tts-cf.<subdomain>.workers.dev" >> $GITHUB_STEP_SUMMARY
+          node -e "
+            const fs = require('fs');
+            const lines = fs.readFileSync('wrangler.toml', 'utf8').split('\n');
+            const line = lines.find(l => l.startsWith('REMOTETOKEN'));
+            if (!line) { console.error('❌ 未找到 REMOTETOKEN'); process.exit(1); }
+            if (!/^REMOTETOKEN = \".*\"$/.test(line)) {
+              console.error('❌ REMOTETOKEN 格式错误:', JSON.stringify(line));
+              process.exit(1);
+            }
+            console.log('✅ REMOTETOKEN 格式正确');
+          "
