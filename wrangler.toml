@@ -10,7 +10,7 @@ REMOTETOKEN = ""
 [[d1_databases]]
 binding = "DB"
 database_name = "tts-db"
-database_id = "8f5f77b9-88e7-4d0a-8649-7c2a074a75c4"
+database_id = "your_d1_id"
 
 [triggers]
 crons = ["0 */6 * * *"]
