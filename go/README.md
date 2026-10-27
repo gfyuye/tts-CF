@@ -8,7 +8,7 @@
 - **低内存**：~5-10MB
 - **快速启动**：~10ms
 - **仅前 5 级**：只请求 `southeastasia/eastus/westeurope/westus2/eastasia`
-- **单次 1s 超时**：3 次重试，最坏 3s
+- **可配置超时/重试**：通过环境变量调整，无需重新编译
 - **优雅关闭**：`SIGTERM` 时取消进行中请求
 
 ## 下载二进制
@@ -79,7 +79,7 @@ API_KEY=your-token-key PORT=8788 ./token-worker
 ```bash
 # 健康检查
 curl http://localhost:8788/health
-# {"status":"ok","apiKey":"configured"}
+# {"status":"ok","apiKey":"configured","timeoutMs":2000,"maxAttempts":3}
 
 # 获取 token
 curl -H "X-API-Key: your-token-key" http://localhost:8788/get-token
@@ -92,6 +92,46 @@ curl -H "X-API-Key: your-token-key" http://localhost:8788/get-token
 |---|---|---|---|
 | `API_KEY` | ✅ | — | token-worker 自己的密钥 |
 | `PORT` | ❌ | `8788` | 监听端口 |
+| `TOKEN_TIMEOUT_MS` | ❌ | `2000` | 单次请求微软的超时（毫秒），上限 60000 |
+| `TOKEN_MAX_ATTEMPTS` | ❌ | `3` | 最多尝试次数，上限 10 |
+
+### 配置示例
+
+```bash
+# 默认配置
+API_KEY=your-key ./token-worker
+
+# 自定义超时和重试
+API_KEY=your-key TOKEN_TIMEOUT_MS=3000 TOKEN_MAX_ATTEMPTS=5 ./token-worker
+
+# 网络较差时放宽
+API_KEY=your-key TOKEN_TIMEOUT_MS=5000 TOKEN_MAX_ATTEMPTS=3 ./token-worker
+```
+
+### 配置约束
+
+| 项 | 上限 | 超限行为 |
+|---|---|---|
+| `TOKEN_TIMEOUT_MS` | 60000（60s） | 钳制到 60000 + 告警 |
+| `TOKEN_MAX_ATTEMPTS` | 10 | 钳制到 10 + 告警 |
+
+**总耗时告警**：若 `TOKEN_TIMEOUT_MS × TOKEN_MAX_ATTEMPTS > 15000`，启动时告警（调用方通常 15s 超时）。
+
+**建议**：
+- 正常网络：默认 `2000ms × 3`，最坏 6s；
+- 跨境网络：`3000ms × 3`，最坏 9s；
+- 极差网络：`5000ms × 2`，最坏 10s；
+- **不超过 `15000ms` 总耗时**，避免调用方超时。
+
+### 启动日志示例
+
+```
+⚙️  TOKEN_TIMEOUT_MS=3000ms
+⚙️  TOKEN_MAX_ATTEMPTS=5
+⚠️ 最坏耗时 15000ms（3s × 5 次）超过 15000ms，调用方可能超时
+🚀 token-worker 监听 0.0.0.0:8788
+   API_KEY: 已配置
+```
 
 ## 接口
 
@@ -99,7 +139,18 @@ curl -H "X-API-Key: your-token-key" http://localhost:8788/get-token
 |---|---|
 | `/get-token` | 获取 token |
 | `/token` | 同 `/get-token` |
-| `/health` | 健康检查 |
+| `/health` | 健康检查（返回当前配置） |
+
+### `/health` 响应
+
+```json
+{
+  "status": "ok",
+  "apiKey": "configured",
+  "timeoutMs": 2000,
+  "maxAttempts": 3
+}
+```
 
 ## 响应
 
@@ -167,6 +218,8 @@ Group=www-data
 WorkingDirectory=/opt/token-worker
 Environment=API_KEY=your-token-key
 Environment=PORT=8788
+Environment=TOKEN_TIMEOUT_MS=2000
+Environment=TOKEN_MAX_ATTEMPTS=3
 ExecStart=/opt/token-worker/token-worker
 Restart=on-failure
 RestartSec=5
@@ -210,7 +263,11 @@ ENTRYPOINT ["/token-worker"]
 
 ```bash
 docker build -t token-worker .
-docker run -d --name token-worker -p 8788:8788 -e API_KEY=your-key token-worker
+docker run -d --name token-worker -p 8788:8788 \
+  -e API_KEY=your-key \
+  -e TOKEN_TIMEOUT_MS=3000 \
+  -e TOKEN_MAX_ATTEMPTS=5 \
+  token-worker
 ```
 
 镜像约 **7MB**。
@@ -249,6 +306,19 @@ token-node https://token.example.com/get-token your-token-key
 
 > `api_key` 与 TTS Worker 自身的 `API_KEY` **无关**，只需与 token-worker 的 `API_KEY` 相同。
 
+### 超时配合
+
+主 Worker 的 `getTokenFromRemoteService` 超时为 **15s**。token-worker 的最坏耗时（`TOKEN_TIMEOUT_MS × TOKEN_MAX_ATTEMPTS`）应 **< 15s**，否则主 Worker 会先超时。
+
+| `TOKEN_TIMEOUT_MS` | `TOKEN_MAX_ATTEMPTS` | 最坏耗时 | 是否安全 |
+|---|---|---|---|
+| 2000（默认） | 3（默认） | 6s | ✅ |
+| 3000 | 3 | 9s | ✅ |
+| 5000 | 3 | 15s | ⚠️ 临界 |
+| 5000 | 5 | 25s | ❌ 超时 |
+
+**建议总耗时 ≤ 12s**，留 3s 余量。
+
 ## 开发
 
 ### 单元测试
@@ -262,19 +332,39 @@ go test -v ./...
 
 见「下载二进制 → 本地编译」。
 
+### 配置调优
+
+根据部署环境调整 `TOKEN_TIMEOUT_MS` / `TOKEN_MAX_ATTEMPTS`：
+
+| 场景 | 配置 |
+|---|---|
+| 网络良好（ms 级延迟） | `TOKEN_TIMEOUT_MS=2000`（默认） |
+| 跨境网络（延迟高） | `TOKEN_TIMEOUT_MS=3000` |
+| 网络极差（频繁超时） | `TOKEN_TIMEOUT_MS=5000 TOKEN_MAX_ATTEMPTS=2` |
+
+**不要超过总耗时 12s**，避免主 Worker 超时。
+
 ## 版本发布
+
+### 手动触发（推荐）
+
+GitHub 仓库 → **Actions** → **Manual Release** → **Run workflow**：
+
+- **Release tag**：`v1.0.0`（必填）
+- **Mark as pre-release**：可选
+
+自动：
+1. 运行测试；
+2. 编译 5 平台；
+3. 创建 tag（若不存在）；
+4. 创建 GitHub Release，附带所有二进制。
+
+### 命令行打 tag
 
 ```bash
 git tag v1.0.0
 git push origin v1.0.0
 ```
-
-GitHub Actions 自动：
-1. 运行测试；
-2. 编译 5 个平台；
-3. 创建 GitHub Release，附带所有二进制。
-
-日常 push 到 `main`（修改 `go/`）会自动更新 `latest` 滚动 Release。
 
 ## 资源占用
 
