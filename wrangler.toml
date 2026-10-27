@@ -7,10 +7,10 @@ WORKER_NODE_ID = "node-a"
 REMOTETOKEN = ""
 
 # D1 绑定由 Dashboard 配置，此处不写 database_id
-# [[d1_databases]]
-# binding = "DB"
-# database_name = "tts-db"
-# database_id = "由 Dashboard 绑定"
+[[d1_databases]]
+binding = "DB"
+database_name = "tts-db"
+database_id = "8f5f77b9-88e7-4d0a-8649-7c2a074a75c4"
 
 [triggers]
 crons = ["0 */6 * * *"]
