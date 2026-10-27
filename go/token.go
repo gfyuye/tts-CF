@@ -33,19 +33,27 @@ const topPriority = 5
 
 const signKeyBase64 = "oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw=="
 
-const dynamicTokenTimeout = 1 * time.Second
-const maxAttempts = 3
+// ============ 可变配置（由 main.go 从环境变量读取） ============
 
-// ============ HTTP Client 单例 ============
+var (
+	dynamicTokenTimeout = 2 * time.Second // TOKEN_TIMEOUT_MS，默认 2000ms
+	maxAttempts         = 3               // TOKEN_MAX_ATTEMPTS，默认 3
+)
 
-var httpClient = &http.Client{
-	Timeout: dynamicTokenTimeout,
-	Transport: &http.Transport{
-		MaxIdleConns:        10,
-		MaxIdleConnsPerHost: 5,
-		IdleConnTimeout:     30 * time.Second,
-		TLSHandshakeTimeout: 5 * time.Second,
-	},
+// ============ HTTP Client（延迟初始化） ============
+
+var httpClient *http.Client
+
+func initHTTPClient() {
+	httpClient = &http.Client{
+		Timeout: dynamicTokenTimeout,
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 5,
+			IdleConnTimeout:     30 * time.Second,
+			TLSHandshakeTimeout: 5 * time.Second,
+		},
+	}
 }
 
 // ============ 类型 ============
@@ -245,7 +253,7 @@ func getDynamicToken(ctx context.Context) (*tokenResult, error) {
 // ============ 刷新 token ============
 
 func refreshToken(ctx context.Context, reqID string) TokenResponse {
-	log.Printf("[%s] 🔄 开始获取token（前%d级优先）", reqID, topPriority)
+	log.Printf("[%s] 🔄 开始获取token（前%d级优先，超时%v，最多%d次）", reqID, topPriority, dynamicTokenTimeout, maxAttempts)
 
 	var lastToken *tokenResult
 
