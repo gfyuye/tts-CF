@@ -6,11 +6,10 @@ compatibility_date = "2024-01-01"
 WORKER_NODE_ID = "node-a"
 REMOTETOKEN = ""
 
-# D1 绑定由 Dashboard 配置，此处不写 database_id
 [[d1_databases]]
 binding = "DB"
 database_name = "tts-db"
-database_id = "your_d1_id"
+database_id = "REPLACE_WITH_YOUR_DATABASE_ID"
 
 [triggers]
 crons = ["0 */6 * * *"]
