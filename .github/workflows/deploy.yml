@@ -67,24 +67,24 @@ jobs:
           DB_NAME="tts-db"
           echo "🔍 查询 D1 数据库: $DB_NAME"
 
-          # 1. 先尝试从 d1 list --json 获取（v4 可能输出非 JSON，用 2>&1 捕获）
-          LIST_RAW=$(wrangler d1 list --remote --json 2>&1 || true)
+          # v4.86.0 的 d1 list 默认操作远程，不加 --remote
+          LIST_RAW=$(wrangler d1 list --json 2>&1 || true)
           echo "=== d1 list 原始输出 ==="
           echo "$LIST_RAW"
 
-          # 2. 尝试提取 JSON（从第一个 [ 开始）
+          # 提取 JSON（从第一个 [ 开始）
           LIST_JSON=$(echo "$LIST_RAW" | sed -n '/^\[/,$p')
           if [ -z "$LIST_JSON" ]; then
             LIST_JSON="[]"
           fi
 
-          # 3. 校验 JSON 合法性，非法则用空数组
+          # 校验 JSON 合法性
           if ! echo "$LIST_JSON" | node -e "JSON.parse(require('fs').readFileSync(0,'utf8'))" 2>/dev/null; then
             echo "⚠️ d1 list 输出非合法 JSON，使用空数组"
             LIST_JSON="[]"
           fi
 
-          # 4. 从 JSON 中查找数据库 ID
+          # 从 JSON 中查找数据库 ID
           DB_ID=$(echo "$LIST_JSON" | node -e "
             try {
               const data = JSON.parse(require('fs').readFileSync(0, 'utf8'));
@@ -95,7 +95,7 @@ jobs:
             }
           ")
 
-          # 5. 若未找到，尝试创建（幂等）
+          # 若未找到，尝试创建（幂等）
           if [ -z "$DB_ID" ]; then
             echo "📦 尝试创建 D1 数据库: $DB_NAME"
             CREATE_OUT=$(wrangler d1 create "$DB_NAME" 2>&1 || true)
@@ -103,19 +103,18 @@ jobs:
             echo "$CREATE_OUT"
 
             if echo "$CREATE_OUT" | grep -qi "already exists"; then
-              echo "ℹ️ 数据库已存在，尝试从文本输出提取 ID"
-              # 回退：从 d1 list 文本输出提取
+              echo "ℹ️ 数据库已存在，从 d1 list 文本输出提取 ID"
               DB_ID=$(echo "$LIST_RAW" | grep -oE "$DB_NAME[[:space:]]+[a-f0-9-]{32,}" | grep -oE "[a-f0-9-]{32,}" | head -1)
             else
               DB_ID=$(echo "$CREATE_OUT" | grep -oE 'database_id = "[^"]+"' | head -1 | sed 's/database_id = "//;s/"//')
             fi
           fi
 
-          # 6. 最终校验
+          # 最终校验
           if [ -z "$DB_ID" ]; then
             echo "❌ 无法获取 database_id"
             echo "=== 最终 d1 list 输出 ==="
-            wrangler d1 list --remote 2>&1 || true
+            wrangler d1 list 2>&1 || true
             exit 1
           fi
 
@@ -162,7 +161,8 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          wrangler d1 execute tts-db --remote --file=schema.sql
+          # v4.86.0 的 d1 execute 默认操作远程，不加 --remote
+          wrangler d1 execute tts-db --file=schema.sql
           echo "✅ D1 表结构已初始化"
 
       - name: Deploy Worker
