@@ -27,36 +27,36 @@
 | `/v1/audio/speech`、`/audio/speech` | POST | OpenAI 兼容 TTS |
 | `/get-token` | GET | 节点间 token 共享（需 HMAC 签名） |
 | `/reader.json` | GET | 阅读 App 导入配置 |
-| `/reader-post.json` | GET | 阅读 App 导入配置（POST） |
+| `/reader-post.json` | GET | 阅读 App 导入配置（POST） | （默认）
 | `/ifreetime.json` | GET | 爱阅记导入配置 |
 
 ## 文件结构
 
-```
 .
 ├── README.md
-├── worker.js                 # 主 TTS Worker
-├── token-worker.js           # 独立 token 获取模块（可选）
+├── worker.js # 主 TTS Worker
+├── token-worker.js # 独立 token 获取模块（可选）
 ├── wrangler.toml
 ├── schema.sql
 ├── package.json
 ├── .gitignore
-├── LICENSE                   # AGPL-3.0
+├── LICENSE # AGPL-3.0
 ├── .github/
-│   └── workflows/
-│       └── deploy.yml
-└── docker/                   # Docker 自托管（可选，与主代码隔离）
-    ├── README.md
-    ├── Dockerfile
-    ├── docker-compose.yml
-    ├── .dockerignore
-    ├── .env.example
-    ├── package.json
-    ├── server.js
-    ├── d1-json.js
-    └── data/
-        └── .gitkeep
-```
+│ └── workflows/
+│ └── deploy.yml
+└── docker/ # Docker 自托管（可选，与主代码隔离）
+├── README.md
+├── Dockerfile
+├── docker-compose.yml
+├── .dockerignore
+├── .env.example
+├── package.json
+├── server.js
+├── d1-json.js
+└── data/
+└── .gitkeep
+text
+
 
 ---
 
@@ -79,207 +79,177 @@
 ```bash
 git clone https://github.com/<your-name>/<repo>.git
 cd <repo>
-```
 
-#### 步骤 2：创建 Cloudflare API Token
+步骤 2：创建 Cloudflare API Token
 
-1. 访问 [Cloudflare Dashboard → API Tokens](https://dash.cloudflare.com/profile/api-tokens)
-2. 使用模板 **Edit Cloudflare Workers**
-3. 额外添加权限：**Account → D1 → Edit**
-4. 复制 Token
+    访问 Cloudflare Dashboard → API Tokens
 
-同时获取 **Account ID**（Dashboard 右侧栏或 Workers 页面 URL 中）。
+    使用模板 Edit Cloudflare Workers
 
-#### 步骤 3：配置 GitHub Secrets 和 Variables
+    额外添加权限：Account → D1 → Edit
 
-进入 GitHub 仓库 → **Settings → Secrets and variables → Actions**：
+    复制 Token
 
-**Secrets**（敏感信息，日志不可见）：
+同时获取 Account ID（Dashboard 右侧栏或 Workers 页面 URL 中）。
+步骤 3：配置 GitHub Secrets 和 Variables
 
-| Name | 值 |
-|---|---|
-| `CLOUDFLARE_API_TOKEN` | 步骤 2 复制的 Token |
-| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Account ID |
-| `API_KEY` | `openssl rand -hex 32` 生成 |
-| `WORKER_SHARED_SECRET` | `openssl rand -hex 32` 生成 |
+进入 GitHub 仓库 → Settings → Secrets and variables → Actions：
 
-**Variables**（明文，日志可见）：
+Secrets（敏感信息，日志不可见）：
+Name	值
+CLOUDFLARE_API_TOKEN	步骤 2 复制的 Token
+CLOUDFLARE_ACCOUNT_ID	Cloudflare Account ID
+API_KEY	openssl rand -hex 32 生成
+WORKER_SHARED_SECRET	openssl rand -hex 32 生成
 
-| Name | 示例 |
-|---|---|
-| `WORKER_NODE_ID` | `node-a` |
-| `REMOTETOKEN` | `node-b https://worker-b.example.workers.dev <B的API_KEY>`（单节点留空） |
+Variables（明文，日志可见）：
+Name	示例
+WORKER_NODE_ID	node-a
+REMOTETOKEN	node-b https://worker-b.example.workers.dev <B的API_KEY>（单节点留空）
+步骤 4：推送到 main
+bash
 
-#### 步骤 4：推送到 main
-
-```bash
 git push origin main
-```
 
 GitHub Actions 自动执行：
 
-1. ✅ 检查配置
-2. 📦 查询/创建 D1 数据库 `tts-db`
-3. 📝 注入 `database_id` 到 `wrangler.toml`
-4. 🗄️ 初始化表结构
-5. 🔐 设置 Worker Secrets
-6. 🚀 部署 Worker
+    ✅ 检查配置
 
-部署完成后访问 `https://tts-worker.<subdomain>.workers.dev`。
+    📦 查询/创建 D1 数据库 tts-db
 
----
+    📝 注入 database_id 到 wrangler.toml
 
-### 方式二：Cloudflare Dashboard 连接 Git
+    🗄️ 初始化表结构
 
-在 Cloudflare Dashboard 中连接 GitHub 仓库，push 自动部署。**需一次性手动配置 D1 和 Secret**。
+    🔐 设置 Worker Secrets
 
-#### 步骤 1：创建 D1 数据库
+    🚀 部署 Worker
 
-Cloudflare Dashboard → **Workers & Pages → D1** → Create database → 名称 `tts-db`。
+部署完成后访问 https://tts-worker.<subdomain>.workers.dev。
+方式二：Cloudflare Dashboard 连接 Git
 
-复制 `database_id`，填入仓库 `wrangler.toml`：
+在 Cloudflare Dashboard 中连接 GitHub 仓库，push 自动部署。需一次性手动配置 D1 和 Secret。
+步骤 1：创建 D1 数据库
 
-```toml
+Cloudflare Dashboard → Workers & Pages → D1 → Create database → 名称 tts-db。
+
+复制 database_id，填入仓库 wrangler.toml：
+toml
+
 [[d1_databases]]
 binding = "DB"
 database_name = "tts-db"
 database_id = "你的database_id"
-```
 
 提交并推送。
+步骤 2：初始化表结构
 
-#### 步骤 2：初始化表结构
+本地执行（需 wrangler login）：
+bash
 
-本地执行（需 `wrangler login`）：
-
-```bash
 npm install
 npx wrangler d1 execute tts-db --remote --file=schema.sql
-```
 
-#### 步骤 3：连接 Git
+步骤 3：连接 Git
 
-Cloudflare Dashboard → **Workers & Pages → Create → Connect to Git**：
+Cloudflare Dashboard → Workers & Pages → Create → Connect to Git：
 
-- 选择你的仓库
-- Build command：留空
-- Deploy command：`npx wrangler deploy`
+    选择你的仓库
 
-#### 步骤 4：设置 Secrets
+    Build command：留空
 
-部署后，Worker → **Settings → Variables and Secrets** → Add：
+    Deploy command：npx wrangler deploy
 
-| Name | Type | 值 |
-|---|---|---|
-| `API_KEY` | Secret | `openssl rand -hex 32` |
-| `WORKER_SHARED_SECRET` | Secret | `openssl rand -hex 32` |
+步骤 4：设置 Secrets
 
-同时确认 `[vars]` 中的 `WORKER_NODE_ID`、`REMOTETOKEN` 正确。
+部署后，Worker → Settings → Variables and Secrets → Add：
+Name	Type	值
+API_KEY	Secret	openssl rand -hex 32
+WORKER_SHARED_SECRET	Secret	openssl rand -hex 32
 
-#### 步骤 5：重新部署
+同时确认 [vars] 中的 WORKER_NODE_ID、REMOTETOKEN 正确。
+步骤 5：重新部署
 
 Dashboard 中 Trigger deploy，或 push 一次提交。
+方式三：Docker 自托管（可选，不依赖 Cloudflare）
 
----
+用 Node.js + JSON 模拟 D1 运行 worker.js，完全脱离 Cloudflare，适合本地开发、测试、单实例自托管。
 
-### 方式三：Docker 自托管（可选，不依赖 Cloudflare）
+详见 docker/README.md。
+bash
 
-用 Node.js + JSON 模拟 D1 运行 `worker.js`，**完全脱离 Cloudflare**，适合本地开发、测试、单实例自托管。
-
-详见 [`docker/README.md`](./docker/README.md)。
-
-```bash
 cd docker
 cp .env.example .env   # 编辑填入 API_KEY / WORKER_SHARED_SECRET
 docker compose up -d --build
 curl http://localhost:8787/health
-```
 
-**局限**：
+局限：
 
-- 单实例，JSON 文件不支持多容器并发写
-- `scheduled` 用 `setInterval` 模拟（每 6 小时）
-- 无 Cloudflare 边缘信息（`request.cf.colo = 'docker'`）
-- 仅支持 `worker.js` 用到的 SQL 子集
+    单实例，JSON 文件不支持多容器并发写
 
-**适用场景**：本地开发、测试、家庭服务器、单实例内网服务。
+    scheduled 用 setInterval 模拟（每 6 小时）
 
-**生产环境推荐方式一或方式二**（Cloudflare 部署，D1 托管，自动扩展）。
+    无 Cloudflare 边缘信息（request.cf.colo = 'docker'）
 
----
+    仅支持 worker.js 用到的 SQL 子集
 
-### 三种部署方式对比
+适用场景：本地开发、测试、家庭服务器、单实例内网服务。
 
-| 项 | 方式一（GitHub Actions） | 方式二（Dashboard 连接 Git） | 方式三（Docker） |
-|---|---|---|---|
-| D1 自动创建 | ✅ | ❌ 需手动创建 | ❌ JSON 模拟 |
-| D1 schema 自动初始化 | ✅ | ❌ 需手动执行 | ✅ JSON 自动 |
-| Secret 自动设置 | ✅ | ❌ 需手动在 Dashboard | ✅ 环境变量 |
-| 依赖 Cloudflare | ✅ | ✅ | ❌ |
-| 多实例 | ✅ | ✅ | ❌ 单实例 |
-| 边缘加速 | ✅ | ✅ | ❌ |
-| 定时任务 | ✅ `scheduled` | ✅ `scheduled` | ⚠️ `setInterval` 模拟 |
-| GitHub 配置量 | Secrets 4 + Variables 2 | 无 | 无 |
-| 适合 | 团队/CI | 个人快速 | 本地/测试/单实例 |
+生产环境推荐方式一或方式二（Cloudflare 部署，D1 托管，自动扩展）。
+三种部署方式对比
+项	方式一（GitHub Actions）	方式二（Dashboard 连接 Git）	方式三（Docker）
+D1 自动创建	✅	❌ 需手动创建	❌ JSON 模拟
+D1 schema 自动初始化	✅	❌ 需手动执行	✅ JSON 自动
+Secret 自动设置	✅	❌ 需手动在 Dashboard	✅ 环境变量
+依赖 Cloudflare	✅	✅	❌
+多实例	✅	✅	❌ 单实例
+边缘加速	✅	✅	❌
+定时任务	✅ scheduled	✅ scheduled	⚠️ setInterval 模拟
+GitHub 配置量	Secrets 4 + Variables 2	无	无
+适合	团队/CI	个人快速	本地/测试/单实例
+环境变量
+明文变量（wrangler.toml 的 [vars]）
+变量	必填	说明	示例
+WORKER_NODE_ID	✅	本节点唯一标识，多节点必须不同	node-a
+REMOTETOKEN	✅	远程节点列表，每行 name url api_key，name 为对方 WORKER_NODE_ID	node-b https://worker-b.workers.dev sk-bbb
 
----
+    REMOTETOKEN 必须每行一条。若环境变量平台吞换行，代码会自动按 https:// 边界拆分并告警，但建议修正配置。
 
-## 环境变量
+Secret
+变量	必填	说明
+API_KEY	✅	对外 API Key，多节点必须相同
+WORKER_SHARED_SECRET	✅	节点间 HMAC 签名密钥，多节点必须相同，≥32 字节随机串
+生成随机密钥
+bash
 
-### 明文变量（`wrangler.toml` 的 `[vars]`）
-
-| 变量 | 必填 | 说明 | 示例 |
-|---|---|---|---|
-| `WORKER_NODE_ID` | ✅ | 本节点唯一标识，多节点必须不同 | `node-a` |
-| `REMOTETOKEN` | ✅ | 远程节点列表，每行 `name url api_key`，`name` 为对方 `WORKER_NODE_ID` | `node-b https://worker-b.workers.dev sk-bbb` |
-
-> `REMOTETOKEN` **必须每行一条**。若环境变量平台吞换行，代码会自动按 `https://` 边界拆分并告警，但建议修正配置。
-
-### Secret
-
-| 变量 | 必填 | 说明 |
-|---|---|---|
-| `API_KEY` | ✅ | 对外 API Key，多节点必须相同 |
-| `WORKER_SHARED_SECRET` | ✅ | 节点间 HMAC 签名密钥，多节点必须相同，≥32 字节随机串 |
-
-### 生成随机密钥
-
-```bash
 openssl rand -hex 32
-```
 
-### Docker 环境变量
+Docker 环境变量
 
-方式三使用 `.env` 文件（见 `docker/.env.example`），变量同上。
-
----
-
-## 多节点部署
+方式三使用 .env 文件（见 docker/.env.example），变量同上。
+多节点部署
 
 两个 Worker 共享 token 池，需保证：
+变量	节点 A	节点 B
+WORKER_NODE_ID	node-a	node-b
+API_KEY	相同	相同
+WORKER_SHARED_SECRET	相同	相同
+REMOTETOKEN	node-b https://worker-b.workers.dev <B的API_KEY>	node-a https://worker-a.workers.dev <A的API_KEY>
 
-| 变量 | 节点 A | 节点 B |
-|---|---|---|
-| `WORKER_NODE_ID` | `node-a` | `node-b` |
-| `API_KEY` | **相同** | **相同** |
-| `WORKER_SHARED_SECRET` | **相同** | **相同** |
-| `REMOTETOKEN` | `node-b https://worker-b.workers.dev <B的API_KEY>` | `node-a https://worker-a.workers.dev <A的API_KEY>` |
-
-两节点共用同一个 D1 数据库（`database_id` 相同）。
+两节点共用同一个 D1 数据库（database_id 相同）。
 
 部署方式：
 
-- **方式一**：两个仓库（或同仓库两 branch），各自配置 GitHub Variables 的 `WORKER_NODE_ID`、`REMOTETOKEN`，`API_KEY`/`WORKER_SHARED_SECRET` 相同。
-- **方式二**：两个 Worker 连接同一仓库不同分支，或手动 deploy 两次改 `WORKER_NODE_ID`。
-- **方式三**：启动两个 Docker 容器，各自的 `.env` 配置 `WORKER_NODE_ID` 和 `REMOTETOKEN`，**不能共用 `data/db.json`**（单实例限制）。
+    方式一：两个仓库（或同仓库两 branch），各自配置 GitHub Variables 的 WORKER_NODE_ID、REMOTETOKEN，API_KEY/WORKER_SHARED_SECRET 相同。
 
----
+    方式二：两个 Worker 连接同一仓库不同分支，或手动 deploy 两次改 WORKER_NODE_ID。
 
-## 使用示例
+    方式三：启动两个 Docker 容器，各自的 .env 配置 WORKER_NODE_ID 和 REMOTETOKEN，不能共用 data/db.json（单实例限制）。
 
-### cURL
+使用示例
+cURL
+bash
 
-```bash
 curl -X POST https://<worker>.workers.dev/tts \
   -H "Content-Type: application/json" \
   -d '{
@@ -290,11 +260,10 @@ curl -X POST https://<worker>.workers.dev/tts \
     "rate": 0,
     "pitch": 0
   }' --output audio.mp3
-```
 
-### OpenAI SDK
+OpenAI SDK
+python
 
-```python
 from openai import OpenAI
 
 client = OpenAI(
@@ -308,42 +277,33 @@ response = client.audio.speech.create(
     input="Hello, world"
 )
 response.stream_to_file("output.mp3")
-```
 
----
+数据库表结构
 
-## 数据库表结构
+见 schema.sql，包含三张表：
 
-见 `schema.sql`，包含三张表：
+    endpoint_table：区域端点表（region, priority, voices_data）
 
-- `endpoint_table`：区域端点表（region, priority, voices_data）
-- `token_cache`：token 缓存（region, token, expiry, priority）
-- `voice_list`：合并语音列表（voice_name, voice_data）
+    token_cache：token 缓存（region, token, expiry, priority）
 
-Docker 方式下由 `docker/d1-json.js` 用 JSON 文件模拟，结构一致。
+    voice_list：合并语音列表（voice_name, voice_data）
 
----
+Docker 方式下由 docker/d1-json.js 用 JSON 文件模拟，结构一致。
+定时刷新
 
-## 定时刷新
+Cloudflare 方式在 wrangler.toml 中配置：
+toml
 
-Cloudflare 方式在 `wrangler.toml` 中配置：
-
-```toml
 [triggers]
 crons = ["0 */6 * * *"]  # 每 6 小时
-```
 
-Docker 方式由 `docker/server.js` 的 `setInterval` 模拟，同样每 6 小时。
+Docker 方式由 docker/server.js 的 setInterval 模拟，同样每 6 小时。
 
-`scheduled` 会重新拉取微软语音列表并写入存储。
+scheduled 会重新拉取微软语音列表并写入存储。
+本地开发
+Cloudflare 方式
+bash
 
----
-
-## 本地开发
-
-### Cloudflare 方式
-
-```bash
 # 安装依赖
 npm install
 
@@ -355,22 +315,18 @@ npm run dev
 
 # 查看远程日志
 npm run tail
-```
 
-### Docker 方式
+Docker 方式
+bash
 
-```bash
 cd docker
 cp .env.example .env
 docker compose up -d --build
 docker compose logs -f
-```
 
----
+架构说明
+text
 
-## 架构说明
-
-```
 ┌─────────────┐         /get-token          ┌─────────────┐
 │  Worker A   │ ◄─────────────────────────► │  Worker B   │
 │  node-a     │   HMAC + TS + NodeId        │  node-b     │
@@ -382,63 +338,119 @@ docker compose logs -f
               │  D1 Database  │
               │  共享 token 池 │
               └───────────────┘
-```
 
-- 每个 Worker 维护内存 token 缓存
-- 本地无可用 token 时，通过 `/get-token` 向对方节点请求
-- 对方节点返回 token，写入本地缓存和 D1
-- 回环检测：A 调 B 后，B 记录"A 刚调过我"，B 反向调 A 时跳过
+    每个 Worker 维护内存 token 缓存
 
-### Token 调用逻辑
+    本地无可用 token 时，通过 /get-token 向对方节点请求
 
-```
+    对方节点返回 token，写入本地缓存和 D1
+
+    回环检测：A 调 B 后，B 记录"A 刚调过我"，B 反向调 A 时跳过
+
+Token 调用逻辑
+text
+
 /tts ──► getVoice ──► getBestToken ──► refreshToken ──► getDynamicToken（直连微软）
                                               │
                                               └─► getTokenFromRemoteService（远程节点）
-```
 
-- `getBestToken` 是所有路径获取 token 的唯一入口
-- 缓存命中且未过期 → 直接返回
-- 缓存命中但即将过期（< 5 分钟）→ 返回旧 token + 后台刷新
-- 缓存未命中 → `ensureRefresh` 单飞刷新
-- `refreshToken` 阶段 1 直连微软，阶段 2 远程节点
-- **无论本地直连还是远程，匹配 `voiceName` + `style` 成功后均写入 `tokenCache` + D1**，供后续复用
+    getBestToken 是所有路径获取 token 的唯一入口
 
----
+    缓存命中且未过期 → 直接返回
 
-## 附：token-worker 模块（独立 token 获取）
+    缓存命中但即将过期（< 5 分钟）→ 返回旧 token + 后台刷新
 
-仓库包含 `token-worker.js`，是一个**完全独立、自包含**的 token 获取模块，可插入到任意 Cloudflare Worker 中，让该 Worker 也提供 `/get-token` 端点，供其他 TTS Worker 获取 token。
+    缓存未命中 → ensureRefresh 单飞刷新
 
-### 适用场景
+    refreshToken 阶段 1 直连微软，阶段 2 远程节点
 
-- 你有一个非 TTS 的 Worker（如 API 网关、工具服务），希望它也能为 TTS Worker 提供 token
-- 你希望多个 TTS Worker 共享一个"专职 token 节点"
-- 你不想在每个 TTS Worker 里都实现完整的微软 token 拉取逻辑
+    无论本地直连还是远程，匹配 voiceName + style 成功后均写入 tokenCache + D1，供后续复用
 
-### 设计要点
+区域优先级设计
 
-| 项 | 说明 |
-|---|---|
-| **仅前 5 级** | 只请求 `southeastasia/eastus/westeurope/westus2/eastasia`，后 4 级不请求 |
-| **不引入节点鉴权** | 无 `X-Node-Id` / `X-Auth` / `X-TS`，仅 `API_KEY` 鉴权，适合非 TTS Worker |
-| **恒定时间比较** | API Key 用 `tokenWorkerTimingSafeEqual`，防时序侧信道 |
-| **未配置 API Key 拒绝** | 与主 `worker.js` 行为一致 |
-| **CORS 支持** | 保留 `Access-Control-Allow-*`，支持浏览器跨域 |
-| **3 次重试** | 前 5 级优先，3 次都失败返回最后 token |
+Worker 维护 9 个区域的端点表，按优先级排序。前 5 级优先用于 token 获取和远程节点协作：
+优先级	区域	说明
+1	southeastasia	东南亚（新加坡），中文语音覆盖最全，优先使用
+2	eastus	美国东部，中文语音覆盖全，延迟略高于东南亚
+3	westeurope	西欧，中文语音覆盖较全
+4	westus2	美国西部，中文语音覆盖较全
+5	eastasia	东亚（香港），中文语音覆盖较全
+6-9	westus、centralindia、northeurope、japaneast	后 4 级，不参与远程 token 获取
 
-> **为什么只保留前 5 级？**
-> 主 `worker.js` 若只拿到后 4 级（`westus/centralindia/northeurope/japaneast`），说明前 5 级当前不可用。此时向远方 `/get-token` 获取，远方同样只能拿后 4 级，**没有增量价值**，反而增加延迟和调用。因此 `token-worker.js` 专注返回前 5 级高质量 token。
+为什么只前 5 级优先？
 
-### 使用步骤
+    前 5 级已覆盖绝大多数中文语音和风格；
 
-#### 步骤 1：复制模块
+    若前 5 级不可用，说明微软侧大面积故障，后 4 级大概率同样不可用；
 
-将 `token-worker.js` 的**全部内容**粘贴到目标 Worker 的 `worker.js` 末尾（或单独文件后 import）。
+    向远程节点获取时，只请求前 5 级，避免"远程也只有后 4 级"的无效调用。
 
-#### 步骤 2：在 `fetch` 入口插入路由
+结合 [placement] 将 Worker 边缘区域尽量放在东亚，可提高申请到前 5 级 token 的概率（微软按客户端 IP 分配附近区域的 token）。
+语音与风格的区域覆盖关系
 
-```js
+/voices 返回的是跨区域合并的语音列表：
+
+    同一语音（如 zh-CN-XiaoxiaoNeural）在多个区域支持时，合并为一条；
+
+    StyleList 是所有区域风格的并集。
+
+这意味着：
+
+    /voices 表格告诉你"某个语音 + 风格组合可能可用"（至少一个区域支持）；
+
+    运行时 checkVoiceStyle(region, voiceName, style) 会按实际 token 的 region 精确校验，不匹配则跳过，继续找匹配的 region；
+
+    所以 /voices 是"可能性"清单，运行时是"精确"校验。
+
+示例：
+语音	风格（并集）	区域覆盖（示例）
+zh-CN-XiaoxiaoNeural	general, cheerful, sad, angry, ...	southeastasia、eastus、westeurope 等
+zh-CN-YunxiNeural	general, cheerful, sad, ...	southeastasia、eastus 等
+zh-CN-XiaomoNeural	general, affectionate, ...	eastus、westeurope 等
+
+    注：上表"区域覆盖"是示例，精确数据需查 /endpoints?detail=1（若 Worker 支持）。
+
+为什么不提供"区域 × 语音 × 风格"的完整矩阵
+
+    数据量太大：5 区域 × 100+ 语音 × 10+ 风格 = 5000+ 组合，README 不可读；
+
+    微软侧动态变化：语音和风格随微软更新变化，硬编码表格容易过期；
+
+    运行时已精确校验：checkVoiceStyle 按实际 token 的 region 校验，不匹配自动跳过，用户无需关心"哪个区域支持"；
+
+    如需精确数据：调用 /endpoints?detail=1（若启用）或 /voices + 区域信息自行组合。
+
+设计取舍：README 提供"合并列表 + 区域优先级说明"，解释设计目的；精确数据由运行时校验和可选 API 提供。
+附：token-worker 模块（独立 token 获取）
+
+仓库包含 token-worker.js，是一个完全独立、自包含的 token 获取模块，可插入到任意 Cloudflare Worker 中，让该 Worker 也提供 /get-token 端点，供其他 TTS Worker 获取 token。
+适用场景
+
+    你有一个非 TTS 的 Worker（如 API 网关、工具服务），希望它也能为 TTS Worker 提供 token
+
+    你希望多个 TTS Worker 共享一个"专职 token 节点"
+
+    你不想在每个 TTS Worker 里都实现完整的微软 token 拉取逻辑
+
+设计要点
+项	说明
+仅前 5 级	只请求 southeastasia/eastus/westeurope/westus2/eastasia，后 4 级不请求
+不引入节点鉴权	无 X-Node-Id / X-Auth / X-TS，仅 API_KEY 鉴权，适合非 TTS Worker
+恒定时间比较	API Key 用 tokenWorkerTimingSafeEqual，防时序侧信道
+未配置 API Key 拒绝	与主 worker.js 行为一致
+CORS 支持	保留 Access-Control-Allow-*，支持浏览器跨域
+3 次重试	前 5 级优先，3 次都失败返回最后 token
+
+    为什么只保留前 5 级？
+    主 worker.js 若只拿到后 4 级（westus/centralindia/northeurope/japaneast），说明前 5 级当前不可用。此时向远方 /get-token 获取，远方同样只能拿后 4 级，没有增量价值，反而增加延迟和调用。因此 token-worker.js 专注返回前 5 级高质量 token。
+
+使用步骤
+步骤 1：复制模块
+
+将 token-worker.js 的全部内容粘贴到目标 Worker 的 worker.js 末尾（或单独文件后 import）。
+步骤 2：在 fetch 入口插入路由
+js
+
 export default {
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
@@ -460,56 +472,51 @@ export default {
 // ============================================================
 // token-worker模块结束
 // ============================================================
-```
 
-#### 步骤 3：配置 API Key
+步骤 3：配置 API Key
+bash
 
-```bash
 npx wrangler secret put API_KEY
-```
 
-或在 `wrangler.toml` 中：
+或在 wrangler.toml 中：
+toml
 
-```toml
 [vars]
 API_KEY = "token-secret-abc"
-```
 
-> `API_KEY` 是 token-worker **自己的**密钥，用于校验 TTS Worker 调用 `/get-token` 时携带的 `X-API-Key`。
-> TTS Worker 的 `REMOTETOKEN` 中对应行的 `api_key` 必须与此值相同。
-> **与 TTS Worker 自身的 `API_KEY`（对外 `/tts` 用）无关**，可以是不同值。
+    API_KEY 是 token-worker 自己的密钥，用于校验 TTS Worker 调用 /get-token 时携带的 X-API-Key。
+    TTS Worker 的 REMOTETOKEN 中对应行的 api_key 必须与此值相同。
+    与 TTS Worker 自身的 API_KEY（对外 /tts 用）无关，可以是不同值。
 
-### 与主 `worker.js` 的关系
+与主 worker.js 的关系
+text
 
-```
 ┌──────────────────┐         /get-token          ┌──────────────────┐
 │  TTS Worker      │ ◄─────────────────────────► │  token-worker    │
 │  (worker.js)     │   X-API-Key                 │  (token-worker.js)│
 │  9 区域 + 缓存   │                             │  仅前 5 级        │
 └──────────────────┘                             └──────────────────┘
-```
 
-- **TTS Worker**：完整的 9 区域 token 池、缓存、远程互调
-- **token-worker**：轻量级，仅提供前 5 级 token 获取，供 TTS Worker 调用
+    TTS Worker：完整的 9 区域 token 池、缓存、远程互调
 
-### 接口
+    token-worker：轻量级，仅提供前 5 级 token 获取，供 TTS Worker 调用
 
-**请求**：
+接口
 
-```http
+请求：
+http
+
 GET /get-token
 X-API-Key: your-api-key
-```
 
 或：
+http
 
-```http
 GET /get-token?api_key=your-api-key
-```
 
-**响应（成功）**：
+响应（成功）：
+json
 
-```json
 {
   "success": true,
   "region": "southeastasia",
@@ -519,145 +526,141 @@ GET /get-token?api_key=your-api-key
   "remainingMinutes": 18,
   "remainingSeconds": 30
 }
-```
 
-**响应（失败）**：
+响应（失败）：
+json
 
-```json
 {
   "success": false,
   "error": "未获取可用的token",
   "message": "无法从微软接口获取 token",
   "timestamp": "2024-01-01T00:00:00.000Z"
 }
-```
 
-**响应（鉴权失败）**：
+响应（鉴权失败）：
+json
 
-```json
 {
   "success": false,
   "error": "认证失败"
 }
-```
+
 （HTTP 401）
+在 TTS Worker 中配置
 
-### 在 TTS Worker 中配置
+在 TTS Worker 的 REMOTETOKEN 中添加 token-worker 节点：
+text
 
-在 TTS Worker 的 `REMOTETOKEN` 中添加 token-worker 节点：
-
-```
 token-node https://your-token-worker.workers.dev/get-token token-secret-abc
-```
 
-| 列 | 值 | 说明 |
-|---|---|---|
-| `name` | `token-node` | 任意标识，需与 TTS Worker 的 `WORKER_NODE_ID` 不同（避免回环误判） |
-| `url` | `https://your-token-worker.workers.dev/get-token` | token-worker 的 `/get-token` 完整地址 |
-| `api_key` | `token-secret-abc` | **等于** token-worker 的 `env.API_KEY` |
+列	值	说明
+name	token-node	任意标识，需与 TTS Worker 的 WORKER_NODE_ID 不同（避免回环误判）
+url	https://your-token-worker.workers.dev/get-token	token-worker 的 /get-token 完整地址
+api_key	token-secret-abc	等于 token-worker 的 env.API_KEY
 
-> ⚠️ **注意**：
-> - 该行的 `api_key` 必须与 token-worker 的 `API_KEY` 相同；
-> - 它与 TTS Worker 自身的 `API_KEY`（对外 `/tts` 用）**无关**，可以是不同值；
-> - token-worker 不参与 HMAC 鉴权，TTS Worker 的 `getTokenFromRemoteService` 会发送 `X-Node-Id`/`X-Auth`/`X-TS`，但 token-worker 忽略这些头，只校验 `X-API-Key`。**两者兼容**。
+    ⚠️ 注意：
 
-### 与主 `worker.js` 的差异对照
+        该行的 api_key 必须与 token-worker 的 API_KEY 相同；
 
-| 项 | `worker.js` | `token-worker.js` |
-|---|---|---|
-| 区域数 | 9 | **5（仅前 5 级）** |
-| 鉴权 | `X-Node-Id` 白名单 + `X-Auth` HMAC + `X-TS` + `X-API-Key` + 限流 | **仅 `X-API-Key`** |
-| 缓存 | 内存 + D1 | **无**（每次直接拉微软） |
-| 回环阻断 | 有 | **无**（无远程互调） |
-| D1 依赖 | 有 | **无** |
-| CORS | 无 | **有** |
-| 定时刷新 | 有（`scheduled`） | **无** |
+        它与 TTS Worker 自身的 API_KEY（对外 /tts 用）无关，可以是不同值；
 
-### 验证
+        token-worker 不参与 HMAC 鉴权，TTS Worker 的 getTokenFromRemoteService 会发送 X-Node-Id/X-Auth/X-TS，但 token-worker 忽略这些头，只校验 X-API-Key。两者兼容。
 
-```bash
+与主 worker.js 的差异对照
+项	worker.js	token-worker.js
+区域数	9	5（仅前 5 级）
+鉴权	X-Node-Id 白名单 + X-Auth HMAC + X-TS + X-API-Key + 限流	仅 X-API-Key
+缓存	内存 + D1	无（每次直接拉微软）
+回环阻断	有	无（无远程互调）
+D1 依赖	有	无
+CORS	无	有
+定时刷新	有（scheduled）	无
+验证
+bash
+
 # 正确 API Key（token-worker 自己的 key）
 curl -H "X-API-Key: token-secret-abc" https://your-token-worker.workers.dev/get-token
 
 # 预期
 # {"success":true,"region":"southeastasia","token":"...","priority":1,...}
-```
 
-```bash
+bash
+
 # 错误 API Key
 curl -H "X-API-Key: wrong" https://your-token-worker.workers.dev/get-token
 
 # 预期
 # HTTP 401 {"success":false,"error":"认证失败"}
-```
 
-### 注意事项
+注意事项
 
-1. **不要**在 token-worker 中配置 `WORKER_NODE_ID`/`WORKER_SHARED_SECRET`（它不使用）
-2. **不要**把 token-worker 加入自身 `REMOTETOKEN`（避免自调用）
-3. token-worker 的 `API_KEY` 与 TTS Worker 自身 `API_KEY` **无关**；它只需与 TTS Worker `REMOTETOKEN` 中对应行的 `api_key` 字段相同
-4. token-worker 无缓存，高频调用会频繁拉微软，建议 TTS Worker 侧做好缓存（主 `worker.js` 已实现）
+    不要在 token-worker 中配置 WORKER_NODE_ID/WORKER_SHARED_SECRET（它不使用）
 
----
+    不要把 token-worker 加入自身 REMOTETOKEN（避免自调用）
 
-## 安全说明
+    token-worker 的 API_KEY 与 TTS Worker 自身 API_KEY 无关；它只需与 TTS Worker REMOTETOKEN 中对应行的 api_key 字段相同
 
-- `API_KEY`、`WORKER_SHARED_SECRET` 用 Secret 存储，不入仓库
-- `/get-token` 四重鉴权：`X-Node-Id` 白名单 + `X-Auth` HMAC + `X-TS` 时间窗 + `X-API-Key`
-- SSML 注入防护：voice/style 白名单 + 正则格式校验 + 内部断言
-- 节点限流：每节点 30 次/分钟
-- 回环阻断：3 分钟
-- Docker 方式：`docker/.env` 不入库，`docker/data/db.json` 含 token 缓存，注意文件权限
+    token-worker 无缓存，高频调用会频繁拉微软，建议 TTS Worker 侧做好缓存（主 worker.js 已实现）
 
----
+安全说明
 
-## 常见问题
+    API_KEY、WORKER_SHARED_SECRET 用 Secret 存储，不入仓库
 
-**Q：方式一 D1 已存在会重复创建吗？**
-A：不会。Workflow 先 `wrangler d1 list --json` 查询，存在则复用 `uuid`，不存在才创建。
+    /get-token 四重鉴权：X-Node-Id 白名单 + X-Auth HMAC + X-TS 时间窗 + X-API-Key
 
-**Q：`REMOTETOKEN` 多行如何放 GitHub Variables？**
-A：直接粘贴多行字符串，GitHub Variables 支持换行。若被吞换行，代码会自动按 `https://` 边界拆分并告警。
+    SSML 注入防护：voice/style 白名单 + 正则格式校验 + 内部断言
 
-**Q：多节点如何用方式一部署？**
-A：每个节点一个仓库 fork（或同仓库不同 branch），各自配置 `WORKER_NODE_ID` 和 `REMOTETOKEN`，`API_KEY`/`WORKER_SHARED_SECRET` 相同，共用同一 D1。
+    节点限流：每节点 30 次/分钟
 
-**Q：Secret 能否用 GitHub Variables 代替？**
-A：可以，但 Variables 在 GitHub 日志/Settings 中明文可见。`API_KEY`/`WORKER_SHARED_SECRET` 必须用 Secrets。
+    回环阻断：3 分钟
 
-**Q：方式二能否自动创建 D1？**
-A：不能。Dashboard 的 Git 集成不支持构建时创建 D1，需手动创建后填 `database_id`。
+    Docker 方式：docker/.env 不入库，docker/data/db.json 含 token 缓存，注意文件权限
 
-**Q：token-worker 能否独立部署？**
+常见问题
+
+Q：方式一 D1 已存在会重复创建吗？
+A：不会。Workflow 先 wrangler d1 list --json 查询，存在则复用 uuid，不存在才创建。
+
+Q：REMOTETOKEN 多行如何放 GitHub Variables？
+A：直接粘贴多行字符串，GitHub Variables 支持换行。若被吞换行，代码会自动按 https:// 边界拆分并告警。
+
+Q：多节点如何用方式一部署？
+A：每个节点一个仓库 fork（或同仓库不同 branch），各自配置 WORKER_NODE_ID 和 REMOTETOKEN，API_KEY/WORKER_SHARED_SECRET 相同，共用同一 D1。
+
+Q：Secret 能否用 GitHub Variables 代替？
+A：可以，但 Variables 在 GitHub 日志/Settings 中明文可见。API_KEY/WORKER_SHARED_SECRET 必须用 Secrets。
+
+Q：方式二能否自动创建 D1？
+A：不能。Dashboard 的 Git 集成不支持构建时创建 D1，需手动创建后填 database_id。
+
+Q：token-worker 能否独立部署？
 A：可以。它本身就是完整的 Worker 代码，单独 deploy 后即可作为独立的 token 服务节点，供 TTS Worker 调用。
 
-**Q：token-worker 和 TTS Worker 必须共用 D1 吗？**
+Q：token-worker 和 TTS Worker 必须共用 D1 吗？
 A：不需要。token-worker 无 D1 依赖，完全无状态。
 
-**Q：token-worker 的 `API_KEY` 必须与 TTS Worker 的 `API_KEY` 相同吗？**
-A：不需要。token-worker 的 `API_KEY` 只用于校验 TTS Worker 调用 `/get-token` 时携带的 `X-API-Key`。TTS Worker 在 `REMOTETOKEN` 中对应行填入这个 key 即可。它与 TTS Worker 自身对外 `/tts` 用的 `API_KEY` 无关，可以是不同值。
+Q：token-worker 的 API_KEY 必须与 TTS Worker 的 API_KEY 相同吗？
+A：不需要。token-worker 的 API_KEY 只用于校验 TTS Worker 调用 /get-token 时携带的 X-API-Key。TTS Worker 在 REMOTETOKEN 中对应行填入这个 key 即可。它与 TTS Worker 自身对外 /tts 用的 API_KEY 无关，可以是不同值。
 
-**Q：Docker 方式能否连接远程 D1？**
+Q：Docker 方式能否连接远程 D1？
 A：不能。Docker 方式用 JSON 文件模拟 D1，完全本地。若需远程 D1，只能部署到 Cloudflare。
 
-**Q：Docker 方式能否多实例？**
+Q：Docker 方式能否多实例？
 A：不能。JSON 文件不支持多容器并发写，只能单实例。多实例请用 Cloudflare 部署。
 
-**Q：Docker 方式的数据存在哪？**
-A：`docker/data/db.json`，挂载到宿主机，重启不丢。已在 `.gitignore` 排除，不入库。
+Q：Docker 方式的数据存在哪？
+A：docker/data/db.json，挂载到宿主机，重启不丢。已在 .gitignore 排除，不入库。
 
-**Q：Docker 方式的 `scheduled` 如何触发？**
-A：`docker/server.js` 用 `setInterval` 每 6 小时调用一次 `worker.scheduled`，模拟 Cloudflare 的 cron。
+Q：Docker 方式的 scheduled 如何触发？
+A：docker/server.js 用 setInterval 每 6 小时调用一次 worker.scheduled，模拟 Cloudflare 的 cron。
 
-**Q：wrangler.toml中的[placement]是否必要？**
-A：本项目需要动态申请微软的token，而不同地区的ip申请到的token往往是附近区域的，并不是所有的地区token都支持所需的语音类型，为了有各大几率申请到到合适token，使用[placement]将worker的边缘区域尽量放在东亚。
+Q：wrangler.toml中的[placement]是否必要？
+A：本项目需要动态申请微软的token，而不同地区的ip申请到的token往往是附近区域的，并不是所有的地区token都支持所需的语音类型，为了有更大几率申请到到合适token，使用[placement]将worker的边缘区域尽量放在东亚。
 
----
-
-## License
+License
 
 GNU Affero General Public License v3.0
 
-本项目采用 [AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.html) 许可。任何修改后的版本若通过网络提供服务，必须以相同许可开源。
+本项目采用 AGPL-3.0 许可。任何修改后的版本若通过网络提供服务，必须以相同许可开源。
 
-详见 [LICENSE](./LICENSE)。
+详见 LICENSE。
