@@ -1156,8 +1156,7 @@ async function parseTTSRequest(request) {
         console.error('  ❌ JSON 解析失败:', error.message);
       }
     } else {
-      const formData = new URLSearchParams(bodyText);
-      console.log('POST JSON text 前 20 字符:', String(data.text || data.t || '').slice(0, 20));
+      const formData = new URLSearchParams(bodyText);      
       const rawRate = Number(formData.get('r') || formData.get('rate')) || 0;
       const rawPitch = Number(formData.get('p') || formData.get('pitch')) || 0;
       const rawFormat = formData.get('o') || 'audio-24khz-48kbitrate-mono-mp3';
