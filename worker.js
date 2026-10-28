@@ -1142,7 +1142,7 @@ async function parseTTSRequest(request) {
         const rawRate = Number(data.rate || data.r) || 0;
         const rawPitch = Number(data.pitch || data.p) || 0;
         const rawFormat = data.outputFormat || data.o || 'audio-24khz-48kbitrate-mono-mp3';
-
+console.log('POST JSON text 前 20 字符:', String(data.text || data.t || '').slice(0, 20));
         Object.assign(params, {
           apiKey: data.api_key || '',
           text: data.text || data.t || '',
