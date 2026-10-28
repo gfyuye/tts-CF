@@ -1,6 +1,6 @@
 # Microsoft TTS Worker
 
-本项目灵感来源于https://github.com/zuoban/tts项目中的worker.js,借用了其中的tts服务页面，对其他部分进行了完全的重构。
+本项目灵感来源于“https://github.com/zuoban/tts”项目中的worker.js,借用了其中的tts服务页面，对其他部分进行了完全的重构。
 本项目基于 Cloudflare Workers 的 Microsoft TTS 代理服务，支持多节点 token 池共享、SSML 注入防护、节点间 HMAC 鉴权、D1 持久化缓存。
 
 ## 特性
