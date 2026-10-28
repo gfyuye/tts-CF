@@ -12,7 +12,7 @@ database_name = "tts-db"
 database_id = "REPLACE_WITH_YOUR_DATABASE_ID"
 
 [triggers]
-crons = ["0 0 * * 0"]
+crons = ["0 0 * * 1"]
 
 [observability]
 enabled = true
