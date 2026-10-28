@@ -1166,7 +1166,7 @@ async function parseTTSRequest(request) {
       // 解码失败，保留原文
     }
   }
-  rawText = rawText.trim();
+  rawText = rawText.replace(/\+/g, ' ').trim();
   // 解码后（关键，确认最终值）
   console.log('POST 表单 text（解码后）:', rawText.slice(0, 20));
       
