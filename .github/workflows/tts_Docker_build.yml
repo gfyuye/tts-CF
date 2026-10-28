@@ -1,7 +1,6 @@
-name: Build and Push Docker Image
+name: Build and Push tts_Docker Image
 
-on:
-  push:
+on:  
   workflow_dispatch:
 
 env:
