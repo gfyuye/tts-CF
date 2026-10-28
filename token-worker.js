@@ -1,5 +1,5 @@
 // ============================================================
-// Token 获取模块（独立自包含，可复制到任何 Worker）
+// token-worker 模块（独立自包含，可插入任何 Worker）
 //
 // 使用方法：
 // 1. 在 fetch 函数开头插入：
@@ -13,23 +13,18 @@
 // 设计说明：
 //   - 仅保留前 5 级优先级（southeastasia/eastus/westeurope/westus2/eastasia）
 //   - 后 4 级（westus/centralindia/northeurope/japaneast）不在此模块请求
-//     原因：主 worker 若只拿到后 4 级，说明前 5 级不可用，
-//           向远方获取同样只有后 4 级，无增量价值
 //   - API Key 恒定时间比较
-//   - API Key 未配置时拒绝（与主 worker.js 行为一致）
-//   - 保留 CORS 与 Cache-Control（其他 Worker 可能需要）
+//   - API Key 未配置时拒绝
+//   - 保留 CORS 与 Cache-Control
 // ============================================================
 
 // ============================================================
-// ============================================================
-// token-worker模块开始
+// token-worker 模块开始
 // ============================================================
 
-// 超时（与主 worker.js 本地直连一致）
-const TOKEN_WORKER_DYNAMIC_TIMEOUT_MS = 1000;  // 单次 1s
-const TOKEN_WORKER_MAX_ATTEMPTS = 3;            // 最多 3 次
+const TOKEN_WORKER_DYNAMIC_TIMEOUT_MS = 1000; // 单次 1s
+const TOKEN_WORKER_MAX_ATTEMPTS = 3;           // 最多 3 次
 
-// Token 优先级（仅前 5 级）
 const TOKEN_WORKER_PRIORITY = [
   { region: 'southeastasia', priority: 1 },
   { region: 'eastus', priority: 2 },
@@ -48,24 +43,129 @@ function tokenWorkerTimingSafeEqual(a, b) {
 }
 
 async function handleGetToken(request, env) {
-  const corsHeaders = { ... };
-  // ... CORS、API Key 验证不变 ...
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-API-Key',
+    'Cache-Control': 'no-store'
+  };
+
+  // ============ CORS 预检 ============
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
+  // ============ API Key 验证 ============
+  const apiKey = request.headers.get('X-API-Key') ||
+                 new URL(request.url).searchParams.get('api_key') ||
+                 '';
+
+  const expectedApiKey = env.API_KEY || '';
+
+  if (!expectedApiKey) {
+    console.error('❌ 未配置 API_KEY，拒绝所有请求');
+    return new Response(JSON.stringify({
+      success: false,
+      error: 'Server misconfigured: API_KEY not set'
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+
+  if (!tokenWorkerTimingSafeEqual(apiKey, expectedApiKey)) {
+    console.warn('❌ API Key 验证失败');
+    return new Response(JSON.stringify({
+      success: false,
+      error: '认证失败'
+    }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+
+  console.log('🔑 token服务API Key 验证通过');
 
   // ============ 工具函数 ============
-  function uuid() { ... }
-  function sleep(ms) { ... }
-  function generateUserId() { ... }
-  function dateFormat() { ... }
-  function getPriority(region) { ... }
-  function decodeJwtPayload(token) { ... }
-  async function hmacSha256(key, data) { ... }
-  async function base64ToBytes(base64) { ... }
-  async function bytesToBase64(bytes) { ... }
+
+  function uuid() {
+    return crypto.randomUUID().replace(/-/g, '');
+  }
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function generateUserId() {
+    const chars = 'abcdef0123456789';
+    let result = '';
+    for (let i = 0; i < 16; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
+    return result;
+  }
+
+  function dateFormat() {
+    const s = new Date().toUTCString().replace(/GMT/, '').trim().toLowerCase();
+    return s + ' gmt';
+  }
+
+  function getPriority(region) {
+    const item = TOKEN_WORKER_PRIORITY.find(p => p.region === region);
+    return item ? item.priority : 99;
+  }
+
+  function decodeJwtPayload(token) {
+    try {
+      const parts = token.split('.');
+      if (parts.length !== 3) return null;
+      const payload = parts[1];
+      const padded = payload.replace(/-/g, '+').replace(/_/g, '/');
+      const padding = '='.repeat((4 - padded.length % 4) % 4);
+      return JSON.parse(atob(padded + padding));
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async function hmacSha256(key, data) {
+    const cryptoKey = await crypto.subtle.importKey(
+      'raw', key,
+      { name: 'HMAC', hash: { name: 'SHA-256' } },
+      false, ['sign']
+    );
+    const signature = await crypto.subtle.sign('HMAC', cryptoKey, new TextEncoder().encode(data));
+    return new Uint8Array(signature);
+  }
+
+  async function base64ToBytes(base64) {
+    const binaryString = atob(base64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+    return bytes;
+  }
+
+  async function bytesToBase64(bytes) {
+    return btoa(String.fromCharCode.apply(null, bytes));
+  }
 
   let _signKeyCache = null;
-  async function sign(urlStr) { ... }
 
-  // ============ 获取动态 token（加 1s 超时） ============
+  async function sign(urlStr) {
+    const url = urlStr.split('://')[1];
+    const encodedUrl = encodeURIComponent(url);
+    const uuidStr = uuid();
+    const formattedDate = dateFormat();
+    const bytesToSign = `MSTranslatorAndroidApp${encodedUrl}${formattedDate}${uuidStr}`.toLowerCase();
+
+    if (!_signKeyCache) {
+      _signKeyCache = await base64ToBytes('oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw==');
+    }
+    const signData = await hmacSha256(_signKeyCache, bytesToSign);
+    const signBase64 = await bytesToBase64(signData);
+    return `MSTranslatorAndroidApp::${signBase64}::${formattedDate}::${uuidStr}`;
+  }
+
+  // ============ 获取动态 token（1s 超时） ============
+
   async function getDynamicToken() {
     let timeout = null;
     try {
@@ -133,6 +233,7 @@ async function handleGetToken(request, env) {
   }
 
   // ============ 刷新 token（3 次，无退避） ============
+
   async function refreshToken() {
     console.log(`🔄 开始获取token（前${TOKEN_WORKER_TOP_PRIORITY}级优先）`);
 
@@ -200,6 +301,7 @@ async function handleGetToken(request, env) {
   }
 
   // ============ 主逻辑 ============
+
   const result = await refreshToken();
 
   return new Response(JSON.stringify(result), {
@@ -209,5 +311,5 @@ async function handleGetToken(request, env) {
 }
 
 // ============================================================
-// token-worker模块结束
+// token-worker 模块结束
 // ============================================================
