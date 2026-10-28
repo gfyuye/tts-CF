@@ -1,14 +1,14 @@
 # Microsoft TTS Worker
 
 本项目灵感来源于“https://github.com/zuoban/tts”项目中的worker.js，借用了其中的tts试听页面，对其他部分进行了完全的重构。
-本项目基于 Cloudflare Workers 的 Microsoft TTS 代理服务，支持多节点 token 池共享、SSML 注入防护、节点间 HMAC 鉴权、D1 持久化缓存。
+本项目基于 Cloudflare Workers 的 Microsoft TTS 代理服务，支持SSML 注入防护、节点间 HMAC 鉴权、D1 持久化缓存。同时，为了解决动态申请的token常常不支持所请求的语音类型这一痛点，特别加入了多节点 token 池共享功能，以扩大token来源。
 
 ## 特性
 
 - 🎙️ **多语音/多风格**：从微软官方语音列表动态生成端点表，支持中文全系列语音
 - 🔗 **多节点 token 池共享**：节点间通过 `/get-token` 互调，HMAC 签名 + 时间戳 + 白名单 + 限流四重鉴权
 - 🛡️ **安全防护**：SSML 注入双重防御、节点鉴权、API Key 恒定时间比较、回环阻断
-- 💾 **D1 持久化**：端点表、token 缓存、语音列表三张表，原子批量写入
+- 💾 **D1 持久化**：端点表、token 缓存、语音列表三张表，原子批量写入，多节点token获取
 - 🔄 **自动刷新**：`scheduled` 定时刷新端点表，分批并发降低 CPU 峰值
 - 🤖 **OpenAI 兼容**：`/v1/audio/speech` 支持 OpenAI TTS 客户端
 - 🎨 **Web 界面**：内置在线 TTS 试听页
@@ -648,6 +648,9 @@ A：`docker/data/db.json`，挂载到宿主机，重启不丢。已在 `.gitigno
 
 **Q：Docker 方式的 `scheduled` 如何触发？**
 A：`docker/server.js` 用 `setInterval` 每 6 小时调用一次 `worker.scheduled`，模拟 Cloudflare 的 cron。
+
+**Q：wrangler.toml中的[placement]是否必要？**
+A：本项目需要动态申请微软的token，而不同地区的ip申请到的token往往是附近区域的，并不是所有的地区token都支持所需的语音类型，为了有各大几率申请到到合适token，使用[placement]将worker的边缘区域尽量放在东亚。
 
 ---
 
