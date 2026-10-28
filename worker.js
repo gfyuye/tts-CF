@@ -1156,7 +1156,9 @@ async function parseTTSRequest(request) {
         console.error('  ❌ JSON 解析失败:', error.message);
       }
     } else {
-      const formData = new URLSearchParams(bodyText);      
+      const formData = new URLSearchParams(bodyText); 
+        // 调试日志（确认后可删）
+  console.log('POST 表单 text 前 20 字符:', String(formData.get('t') || formData.get('text') || '').slice(0, 20));
       const rawRate = Number(formData.get('r') || formData.get('rate')) || 0;
       const rawPitch = Number(formData.get('p') || formData.get('pitch')) || 0;
       const rawFormat = formData.get('o') || 'audio-24khz-48kbitrate-mono-mp3';
