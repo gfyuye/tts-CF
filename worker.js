@@ -1155,25 +1155,38 @@ async function parseTTSRequest(request) {
       } catch (error) {
         console.error('  ❌ JSON 解析失败:', error.message);
       }
-    } else {
-      const formData = new URLSearchParams(bodyText); 
-        // 调试日志（确认后可删）
-  console.log('POST 表单 text 前 20 字符:', String(formData.get('t') || formData.get('text') || '').slice(0, 20));
-      const rawRate = Number(formData.get('r') || formData.get('rate')) || 0;
-      const rawPitch = Number(formData.get('p') || formData.get('pitch')) || 0;
-      const rawFormat = formData.get('o') || 'audio-24khz-48kbitrate-mono-mp3';
+} else {
+  const formData = new URLSearchParams(bodyText);
 
-      Object.assign(params, {
-        apiKey: formData.get('api_key') || '',
-        text: formData.get('t') || formData.get('text') || '',
-        voiceName: formData.get('v') || formData.get('voice') || '',
-        rate: clamp(rawRate, RATE_MIN, RATE_MAX),
-        pitch: clamp(rawPitch, PITCH_MIN, PITCH_MAX),
-        style: cleanStyle(formData.get('s') || formData.get('style') || 'general'),
-        outputFormat: OUTPUT_FORMAT_PATTERN.test(rawFormat) ? rawFormat : 'audio-24khz-48kbitrate-mono-mp3',
-        download: formData.get('d') === 'true' || formData.get('download') === 'true'
-      });
+  // 调试日志（确认后可删）
+  console.log('POST 表单 text 前 20 字符:', String(formData.get('t') || formData.get('text') || '').slice(0, 20));
+
+  // 安全解码：URLSearchParams 已解一层，这里再解一层（应对双重编码）
+  let rawText = String(formData.get('t') || formData.get('text') || '');
+  if (/%[0-9A-Fa-f]{2}/.test(rawText)) {
+    try {
+      rawText = decodeURIComponent(rawText);
+    } catch {
+      // 解码失败，保留原文
     }
+  }
+  rawText = rawText.trim();
+
+  const rawRate = Number(formData.get('r') || formData.get('rate')) || 0;
+  const rawPitch = Number(formData.get('p') || formData.get('pitch')) || 0;
+  const rawFormat = formData.get('o') || 'audio-24khz-48kbitrate-mono-mp3';
+
+  Object.assign(params, {
+    apiKey: formData.get('api_key') || '',
+    text: rawText,  // ← 用解码后的
+    voiceName: formData.get('v') || formData.get('voice') || '',
+    rate: clamp(rawRate, RATE_MIN, RATE_MAX),
+    pitch: clamp(rawPitch, PITCH_MIN, PITCH_MAX),
+    style: cleanStyle(formData.get('s') || formData.get('style') || 'general'),
+    outputFormat: OUTPUT_FORMAT_PATTERN.test(rawFormat) ? rawFormat : 'audio-24khz-48kbitrate-mono-mp3',
+    download: formData.get('d') === 'true' || formData.get('download') === 'true'
+  });
+}
   } else {
     const sp = new URL(request.url).searchParams;
     console.log('📥 GET 请求参数:', request.url);
