@@ -1157,10 +1157,6 @@ async function parseTTSRequest(request) {
       }
 } else {
   const formData = new URLSearchParams(bodyText);
-
-  // 调试日志（确认后可删）
-  console.log('POST 表单 text 前 20 字符:', String(formData.get('t') || formData.get('text') || '').slice(0, 20));
-
   // 安全解码：URLSearchParams 已解一层，这里再解一层（应对双重编码）
   let rawText = String(formData.get('t') || formData.get('text') || '');
   if (/%[0-9A-Fa-f]{2}/.test(rawText)) {
@@ -1171,7 +1167,9 @@ async function parseTTSRequest(request) {
     }
   }
   rawText = rawText.trim();
-
+  // 解码后（关键，确认最终值）
+  console.log('POST 表单 text（解码后）:', rawText.slice(0, 20));
+      
   const rawRate = Number(formData.get('r') || formData.get('rate')) || 0;
   const rawPitch = Number(formData.get('p') || formData.get('pitch')) || 0;
   const rawFormat = formData.get('o') || 'audio-24khz-48kbitrate-mono-mp3';
