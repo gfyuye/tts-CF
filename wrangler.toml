@@ -1,6 +1,6 @@
 name = "tts-cf"
 main = "worker.js"
-compatibility_date = "2024-01-01"
+compatibility_date = "2026-10-28"
 
 [vars]
 WORKER_NODE_ID = "node-a"
